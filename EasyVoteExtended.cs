@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
@@ -13,7 +13,7 @@ using UnityEngine.Networking;
 
 namespace Oxide.Plugins
 {
-    [Info("Easy Vote Extended", "dFxPhoeniX", "3.0.4")]
+    [Info("Easy Vote Extended", "dFxPhoeniX&TimRS", "3.0.4")]
     [Description("The best Rust server voting system")]
     public class EasyVoteExtended : RustPlugin
     {
