@@ -1,7 +1,7 @@
 ## Overview
 **Easy Vote Extended** is an upgraded version of Easy Vote, the most advanced and versatile voting plugin available, designed to enhance player engagement and community interaction effortlessly.
 
-With its fully customizable system, server owners can tailor every aspect of the voting process without any coding knowledge, and supporting 6 voting sites, and more to be added.
+With its fully customizable system, server owners can tailor every aspect of the voting process without any coding knowledge, and supporting 6 voting sites and more to be added.
 
 ## Chat Commands
 * ``/vote`` - Show vote link(s).
