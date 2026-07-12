@@ -2,6 +2,7 @@
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.RegularExpressions;
 using Facepunch.Extend;
 using Newtonsoft.Json;
 using Oxide.Core;
@@ -13,25 +14,51 @@ using UnityEngine.Networking;
 
 namespace Oxide.Plugins
 {
-    [Info("Easy Vote Extended", "dFxPhoeniX&TimRS", "3.2.1")]
+    [Info("Easy Vote Extended", "dFxPhoeniX&TimRS", "3.2.9")]
     [Description("The best Rust server voting system")]
     public class EasyVoteExtended : RustPlugin
     {
         private readonly HashSet<string> pendingClaims = new HashSet<string>();
         private readonly HashSet<string> pendingStatusChecks = new HashSet<string>();
+        private readonly Dictionary<string, string> statusRequestTokens = new Dictionary<string, string>();
         private readonly HashSet<ulong> scheduledVoteChecks = new HashSet<ulong>();
         private readonly HashSet<string> reportedConfigurationWarnings = new HashSet<string>();
         private readonly Queue<Action> claimRequestQueue = new Queue<Action>();
         private readonly Queue<Action> voteRequestQueue = new Queue<Action>();
         private readonly Dictionary<string, float> commandCooldowns = new Dictionary<string, float>();
+        private readonly HashSet<string> scheduledClaimRetries = new HashSet<string>();
         private Dictionary<string, List<string>> pendingRewardCommands = new Dictionary<string, List<string>>();
+        private Dictionary<string, PendingClaimTransaction> pendingClaimTransactions = new Dictionary<string, PendingClaimTransaction>();
 
         private const int CurrentConfigurationVersion = 1;
         private const int DefaultAutomaticVoteCheckInterval = 300;
         private const int DefaultVoteFollowUpCheckDelay = 60;
         private const float VoteRequestSpacing = 0.2f;
         private const float ManualCommandCooldown = 10f;
+        private const int VoteApiRequestTimeout = 15000;
+        private const int MaximumClaimAttempts = 6;
         private const string PendingRewardsDataFileName = "EasyVoteExtended_PendingRewards";
+        private const string PendingClaimsDataFileName = "EasyVoteExtended_PendingClaims";
+        private const string PendingRewardTransactionPrefix = "__EVE_TX__:";
+        private const string ClaimStateCreated = "Created";
+        private const string ClaimStateSent = "Sent";
+        private const string ClaimStateUncertain = "Uncertain";
+        private const string ClaimStateConfirmed = "Confirmed";
+        private const string ClaimStateManualReview = "ManualReview";
+
+        private class PendingClaimTransaction
+        {
+            public string TransactionId;
+            public ulong PlayerId;
+            public string PlayerName;
+            public string ServerName;
+            public string Site;
+            public bool NotifyPlayer;
+            public int Attempts;
+            public string State;
+            public bool HadAmbiguousFailure;
+            public int TargetVoteCount;
+        }
 
         ////////////////////////////////////////////////////////////
         // Oxide Hooks
@@ -39,14 +66,17 @@ namespace Oxide.Plugins
 
         private void Init()
         {
+            // LoadConfig() normally validates the configuration before Init().
+            // Keep this fallback only for unexpected load-order scenarios.
             if (_config == null)
             {
                 _config = Config.ReadObject<PluginConfig>();
+                EnsureConfigDefaults();
             }
 
-            EnsureConfigDefaults();
             LoadMessages();
             LoadPendingRewardsData();
+            LoadPendingClaimsData();
         }
 
         private void OnServerInitialized()
@@ -55,6 +85,7 @@ namespace Oxide.Plugins
 
             StartRequestQueueProcessor();
             StartAutomaticVoteChecks();
+            RecoverPendingClaimTransactions();
 
             timer.Once(2f, () =>
             {
@@ -76,12 +107,15 @@ namespace Oxide.Plugins
         {
             pendingClaims.Clear();
             pendingStatusChecks.Clear();
+            statusRequestTokens.Clear();
             scheduledVoteChecks.Clear();
             reportedConfigurationWarnings.Clear();
             claimRequestQueue.Clear();
             voteRequestQueue.Clear();
             commandCooldowns.Clear();
+            scheduledClaimRetries.Clear();
             SavePendingRewardsData();
+            SavePendingClaimsData();
         }
 
         private void OnNewSave(string filename)
@@ -106,11 +140,13 @@ namespace Oxide.Plugins
 
             CheckIfPlayerDataExists(player);
 
+            ulong connectedPlayerId = player.userID;
             timer.Once(2f, () =>
             {
-                if (player != null && player.IsConnected)
+                BasePlayer connectedPlayer = BasePlayer.FindByID(connectedPlayerId);
+                if (connectedPlayer != null && connectedPlayer.IsConnected)
                 {
-                    DeliverPendingRewards(player);
+                    DeliverPendingRewards(connectedPlayer);
                 }
             });
 
@@ -132,6 +168,7 @@ namespace Oxide.Plugins
 
             commandCooldowns.Remove($"{player.UserIDString}:vote");
             commandCooldowns.Remove($"{player.UserIDString}:claim");
+            scheduledVoteChecks.Remove(player.userID);
         }
 
         private void OnPlayerSleepEnded(BasePlayer player)
@@ -152,16 +189,31 @@ namespace Oxide.Plugins
         // General Methods
         ////////////////////////////////////////////////////////////
 
-        private void HandleClaimWebRequestCallback(int code, string response, BasePlayer player, string url, string serverName, string site, bool notifyPlayer, string pendingClaimKey)
+        private void HandleClaimWebRequestCallback(int code, string response, string pendingClaimKey, string transactionId, string requestToken)
         {
-            pendingClaims.Remove(pendingClaimKey);
+            pendingClaims.Remove(requestToken);
+
+            PendingClaimTransaction transaction;
+            if (!TryGetActiveClaimTransaction(pendingClaimKey, transactionId, out transaction))
+            {
+                _Debug($"Ignoring a stale claim callback for transaction {transactionId}.");
+                return;
+            }
+
+            string playerSteamId = transaction.PlayerId.ToString();
+            BasePlayer player = FindPlayer(transaction.PlayerId);
+            string resolvedPlayerName = GetResolvedPlayerName(player, transaction.PlayerName, playerSteamId);
 
             if (code != 200)
             {
-                ConsoleError($"An error occurred while trying to claim the vote reward of the player {player?.displayName}:{player?.UserIDString}");
-                ConsoleWarn($"URL: {MaskApiUrl(url)}");
-                ConsoleWarn($"HTTP Code: {code} | Response: {response} | Server Name: {serverName}");
-                ConsoleWarn("This error could be due to a malformed or incorrect server token, id, or player id / username issue. Most likely its due to your server key being incorrect. Check that your server key is correct.");
+                transaction.State = ClaimStateUncertain;
+                transaction.HadAmbiguousFailure = true;
+                SavePendingClaimsData();
+
+                ConsoleError($"An error occurred while trying to claim the vote reward of the player {resolvedPlayerName}:{playerSteamId}");
+                ConsoleWarn($"HTTP Code: {code} | Response: {response} | Server Name: {transaction.ServerName}");
+                ConsoleWarn("The claim transaction was preserved and will be retried automatically.");
+                ScheduleClaimRetry(pendingClaimKey);
                 return;
             }
 
@@ -169,13 +221,12 @@ namespace Oxide.Plugins
 
             _Debug("------------------------------");
             _Debug("Method: HandleClaimWebRequestCallback");
-            _Debug($"Site: {site}");
+            _Debug($"Site: {transaction.Site}");
             _Debug($"Code: {code}");
             _Debug($"Response: {response}");
-            _Debug($"URL: {MaskApiUrl(url)}");
-            _Debug($"ServerName: {serverName}");
-            _Debug($"Player Name: {player?.displayName}");
-            _Debug($"Player SteamID: {player?.UserIDString}");
+            _Debug($"ServerName: {transaction.ServerName}");
+            _Debug($"Player Name: {resolvedPlayerName}");
+            _Debug($"Player SteamID: {playerSteamId}");
             _Debug("Web Request Type: Claim");
 
             if (_config.DebugSettings[ConfigDefaultKeys.VerboseDebugEnabled].ToBool())
@@ -186,56 +237,180 @@ namespace Oxide.Plugins
 
             if (response == "1")
             {
-                BasePlayer rewardPlayer = player == null ? null : BasePlayer.FindByID(player.userID) ?? player;
-                bool rewardConfigured = HandleVoteCount(rewardPlayer);
-                string playerName = rewardPlayer?.displayName ?? rewardPlayer?.UserIDString ?? "Unknown";
-                string playerSteamId = rewardPlayer?.UserIDString;
-                string voteCount = GetStoredVoteCount(playerSteamId).ToString();
+                ConfirmClaimTransaction(pendingClaimKey, transaction);
+                return;
+            }
 
-                if (rewardPlayer != null && rewardPlayer.IsConnected)
+            if (response == "2")
+            {
+                if (transaction.HadAmbiguousFailure)
                 {
-                    string messageKey = rewardConfigured ? "ThankYou" : "ThankYouNoReward";
-                    rewardPlayer.ChatMessage(_lang(messageKey, rewardPlayer.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], voteCount, site));
+                    // A previous request was sent but its response was lost or invalid.
+                    // In the normal one-plugin workflow, "already claimed" now confirms
+                    // that the preserved request reached the tracker.
+                    ConfirmClaimTransaction(pendingClaimKey, transaction);
+                    return;
                 }
 
-                if (_config.Discord[ConfigDefaultKeys.DiscordEnabled].ToBool())
+                RemovePendingClaimTransaction(pendingClaimKey);
+
+                if (transaction.NotifyPlayer && player != null && player.IsConnected)
                 {
-                    string discordMessageKey = rewardConfigured ? "DiscordWebhookMessage" : "DiscordWebhookMessageNoReward";
-                    ServerMgr.Instance.StartCoroutine(DiscordSendMessage(_lang(discordMessageKey, null, playerName, serverName, site)));
+                    player.ChatMessage(_lang("AlreadyVoted", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], transaction.Site));
                 }
 
-                if (_config.NotificationSettings[ConfigDefaultKeys.GlobalChatAnnouncements].ToBool())
-                {
-                    string globalMessageKey = rewardConfigured ? "GlobalChatAnnouncements" : "GlobalChatAnnouncementsNoReward";
+                return;
+            }
 
-                    foreach (BasePlayer recipient in BasePlayer.activePlayerList)
+            if (response == "0")
+            {
+                RemovePendingClaimTransaction(pendingClaimKey);
+
+                if (transaction.NotifyPlayer && player != null && player.IsConnected)
+                {
+                    player.ChatMessage(_lang("ClaimStatus", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], transaction.Site, transaction.ServerName));
+                }
+
+                return;
+            }
+
+            transaction.State = ClaimStateUncertain;
+            transaction.HadAmbiguousFailure = true;
+            SavePendingClaimsData();
+
+            ConsoleWarn($"Unexpected claim API response from {transaction.Site} for {resolvedPlayerName}/{playerSteamId} on {transaction.ServerName}: '{response ?? "null"}'. Expected 0, 1, or 2. The claim transaction will be retried.");
+            ScheduleClaimRetry(pendingClaimKey);
+        }
+
+        private bool TryGetActiveClaimTransaction(string pendingClaimKey, string transactionId, out PendingClaimTransaction transaction)
+        {
+            transaction = null;
+
+            return !string.IsNullOrEmpty(transactionId) &&
+                   pendingClaimTransactions.TryGetValue(pendingClaimKey, out transaction) &&
+                   transaction != null &&
+                   string.Equals(transaction.TransactionId, transactionId, StringComparison.Ordinal);
+        }
+
+        private void ConfirmClaimTransaction(string pendingClaimKey, PendingClaimTransaction transaction)
+        {
+            if (transaction == null ||
+                !pendingClaimTransactions.ContainsKey(pendingClaimKey) ||
+                !ReferenceEquals(pendingClaimTransactions[pendingClaimKey], transaction))
+            {
+                return;
+            }
+
+            if (transaction.TargetVoteCount <= 0)
+            {
+                transaction.TargetVoteCount = GetStoredVoteCount(transaction.PlayerId.ToString()) + 1;
+            }
+
+            transaction.State = ClaimStateConfirmed;
+            SavePendingClaimsData();
+            FinalizeConfirmedClaimTransaction(pendingClaimKey, transaction.TransactionId);
+        }
+
+        private void FinalizeConfirmedClaimTransaction(string pendingClaimKey, string transactionId)
+        {
+            PendingClaimTransaction transaction;
+            if (!TryGetActiveClaimTransaction(pendingClaimKey, transactionId, out transaction) ||
+                !string.Equals(transaction.State, ClaimStateConfirmed, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            string playerSteamId = transaction.PlayerId.ToString();
+            BasePlayer player = FindPlayer(transaction.PlayerId);
+            string resolvedPlayerName = GetResolvedPlayerName(player, transaction.PlayerName, playerSteamId);
+            int targetVoteCount = Math.Max(1, transaction.TargetVoteCount);
+            int currentVoteCount = GetStoredVoteCount(playerSteamId);
+
+            if (currentVoteCount < targetVoteCount)
+            {
+                DataFile[playerSteamId] = targetVoteCount;
+                SaveDataFile(DataFile);
+            }
+
+            bool cumulativeRewards = _config.PluginSettings[ConfigDefaultKeys.RewardIsCumulative].ToBool();
+            List<string> rewardCommands = BuildRewardCommands(transaction.PlayerId, resolvedPlayerName, targetVoteCount, cumulativeRewards);
+            bool rewardConfigured = rewardCommands.Count > 0;
+
+            if (rewardConfigured &&
+                !QueuePendingRewardTransaction(playerSteamId, transaction.TransactionId, rewardCommands))
+            {
+                ConsoleError($"Failed to persist reward commands for claim transaction {transaction.TransactionId}. Local completion will be retried.");
+                ScheduleClaimRetry(pendingClaimKey);
+                return;
+            }
+
+            // Removing the claim transaction only after the vote count and reward
+            // queue are persisted makes local completion idempotent after reloads.
+            RemovePendingClaimTransaction(pendingClaimKey);
+
+            bool rewardDeliveredImmediately = rewardConfigured &&
+                                             player != null &&
+                                             player.IsConnected &&
+                                             !player.IsSleeping();
+
+            if (rewardDeliveredImmediately)
+            {
+                DeliverPendingRewards(player, false);
+            }
+
+            string displayedVoteCount = GetStoredVoteCount(playerSteamId).ToString();
+
+            if (player != null && player.IsConnected)
+            {
+                string messageKey = rewardConfigured
+                    ? (rewardDeliveredImmediately ? "ThankYou" : "ThankYouPending")
+                    : "ThankYouNoReward";
+
+                player.ChatMessage(_lang(messageKey, player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], displayedVoteCount, transaction.Site));
+            }
+
+            if (_config.Discord[ConfigDefaultKeys.DiscordEnabled].ToBool())
+            {
+                string discordMessageKey = rewardConfigured
+                    ? (rewardDeliveredImmediately ? "DiscordWebhookMessage" : "DiscordWebhookMessagePending")
+                    : "DiscordWebhookMessageNoReward";
+
+                ServerMgr.Instance.StartCoroutine(DiscordSendMessage(_lang(discordMessageKey, null, resolvedPlayerName, transaction.ServerName, transaction.Site)));
+            }
+
+            if (_config.NotificationSettings[ConfigDefaultKeys.GlobalChatAnnouncements].ToBool())
+            {
+                string globalMessageKey = rewardConfigured
+                    ? (rewardDeliveredImmediately ? "GlobalChatAnnouncements" : "GlobalChatAnnouncementsPending")
+                    : "GlobalChatAnnouncementsNoReward";
+
+                foreach (BasePlayer recipient in BasePlayer.activePlayerList)
+                {
+                    if (recipient == null || !recipient.IsConnected)
                     {
-                        if (recipient == null || !recipient.IsConnected)
-                        {
-                            continue;
-                        }
-
-                        recipient.ChatMessage(_lang(globalMessageKey, recipient.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], playerName, voteCount));
+                        continue;
                     }
+
+                    recipient.ChatMessage(_lang(globalMessageKey, recipient.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], resolvedPlayerName, displayedVoteCount));
                 }
-            }
-            else if (notifyPlayer && player != null && player.IsConnected && response == "2")
-            {
-                player.ChatMessage(_lang("AlreadyVoted", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], site));
-            }
-            else if (notifyPlayer && player != null && player.IsConnected)
-            {
-                player.ChatMessage(_lang("ClaimStatus", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], site, serverName));
             }
         }
 
-        private void HandleStatusWebRequestCallback(int code, string response, BasePlayer player, string statusUrl, string claimUrl, string serverName, string site, bool notifyPlayer, string pendingStatusKey)
+        private void HandleStatusWebRequestCallback(int code, string response, ulong playerId, string playerName, string statusUrl, string serverName, string site, bool notifyPlayer, string pendingStatusKey, string statusRequestToken)
         {
-            pendingStatusChecks.Remove(pendingStatusKey);
+            if (!TryConsumeStatusRequest(pendingStatusKey, statusRequestToken))
+            {
+                _Debug($"Ignoring a stale status callback for {playerName}/{playerId} on {site} ({serverName}).");
+                return;
+            }
+
+            string playerSteamId = playerId.ToString();
+            BasePlayer player = FindPlayer(playerId);
+            string resolvedPlayerName = GetResolvedPlayerName(player, playerName, playerSteamId);
 
             if (code != 200)
             {
-                ConsoleError($"An error occurred while trying to check the vote status of the player {player?.displayName}:{player?.UserIDString}");
+                ConsoleError($"An error occurred while trying to check the vote status of the player {resolvedPlayerName}:{playerSteamId}");
                 ConsoleWarn($"URL: {MaskApiUrl(statusUrl)}");
                 ConsoleWarn($"HTTP Code: {code} | Response: {response} | Server Name: {serverName}");
                 ConsoleWarn("This error could be due to a malformed or incorrect server token, id, or player id / username issue. Most likely its due to your server key being incorrect. Check that your server key is correct.");
@@ -251,8 +426,8 @@ namespace Oxide.Plugins
             _Debug($"Response: {response}");
             _Debug($"URL: {MaskApiUrl(statusUrl)}");
             _Debug($"ServerName: {serverName}");
-            _Debug($"Player Name: {player?.displayName}");
-            _Debug($"Player SteamID: {player?.UserIDString}");
+            _Debug($"Player Name: {resolvedPlayerName}");
+            _Debug($"Player SteamID: {playerSteamId}");
             _Debug("Web Request Type: Status/Check");
 
             if (_config.DebugSettings[ConfigDefaultKeys.VerboseDebugEnabled].ToBool())
@@ -261,64 +436,440 @@ namespace Oxide.Plugins
                 response = _config.DebugSettings[ConfigDefaultKeys.CheckAPIResponseCode];
             }
 
+            string pendingClaimKey = GetPendingClaimKey(playerId, serverName, site);
+            PendingClaimTransaction existingTransaction;
+            pendingClaimTransactions.TryGetValue(pendingClaimKey, out existingTransaction);
+
             if (response == "1")
             {
-                EnqueueClaimRequest(player, claimUrl, serverName, site, notifyPlayer);
+                EnqueueClaimRequest(playerId, resolvedPlayerName, serverName, site, notifyPlayer);
+                return;
             }
-            else if (notifyPlayer && player != null && player.IsConnected && response == "0")
+
+            if (response == "0")
             {
-                player.ChatMessage(_lang("NoRewards", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], serverName, site));
+                if (existingTransaction != null)
+                {
+                    RemovePendingClaimTransaction(pendingClaimKey);
+                }
+
+                if (notifyPlayer && player != null && player.IsConnected)
+                {
+                    player.ChatMessage(_lang("NoRewards", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], serverName, site));
+                }
+
+                return;
             }
-            else if (notifyPlayer && player != null && player.IsConnected && response == "2")
+
+            if (response == "2")
             {
-                player.ChatMessage(_lang("AlreadyVoted", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], site));
+                if (existingTransaction != null && existingTransaction.HadAmbiguousFailure)
+                {
+                    ConfirmClaimTransaction(pendingClaimKey, existingTransaction);
+                    return;
+                }
+
+                if (existingTransaction != null)
+                {
+                    RemovePendingClaimTransaction(pendingClaimKey);
+                }
+
+                if (notifyPlayer && player != null && player.IsConnected)
+                {
+                    player.ChatMessage(_lang("AlreadyVoted", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], site));
+                }
+
+                return;
+            }
+
+            ConsoleWarn($"Unexpected status API response from {site} for {resolvedPlayerName}/{playerSteamId} on {serverName}: '{response ?? "null"}'. Expected 0, 1, or 2.");
+        }
+
+        private bool IsActiveStatusRequest(string pendingStatusKey, string statusRequestToken)
+        {
+            string activeToken;
+            return !string.IsNullOrEmpty(statusRequestToken) &&
+                   statusRequestTokens.TryGetValue(pendingStatusKey, out activeToken) &&
+                   string.Equals(activeToken, statusRequestToken, StringComparison.Ordinal);
+        }
+
+        private bool TryConsumeStatusRequest(string pendingStatusKey, string statusRequestToken)
+        {
+            if (!IsActiveStatusRequest(pendingStatusKey, statusRequestToken))
+            {
+                return false;
+            }
+
+            statusRequestTokens.Remove(pendingStatusKey);
+            pendingStatusChecks.Remove(pendingStatusKey);
+            return true;
+        }
+
+        private void CancelStatusRequest(string pendingStatusKey, string statusRequestToken)
+        {
+            if (!IsActiveStatusRequest(pendingStatusKey, statusRequestToken))
+            {
+                return;
+            }
+
+            statusRequestTokens.Remove(pendingStatusKey);
+            pendingStatusChecks.Remove(pendingStatusKey);
+        }
+
+        private void CancelStatusRequestsForPlayer(string steamId)
+        {
+            if (string.IsNullOrEmpty(steamId))
+            {
+                return;
+            }
+
+            foreach (string pendingStatusKey in statusRequestTokens.Keys
+                .Where(key => key.StartsWith(steamId + ":", StringComparison.Ordinal))
+                .ToList())
+            {
+                statusRequestTokens.Remove(pendingStatusKey);
+                pendingStatusChecks.Remove(pendingStatusKey);
             }
         }
 
-        private void EnqueueClaimRequest(BasePlayer player, string claimUrl, string serverName, string site, bool notifyPlayer)
+        private void EnqueueClaimRequest(ulong playerId, string playerName, string serverName, string site, bool notifyPlayer)
         {
-            if (player == null)
+            string pendingClaimKey = GetPendingClaimKey(playerId, serverName, site);
+            PendingClaimTransaction transaction;
+
+            if (!pendingClaimTransactions.TryGetValue(pendingClaimKey, out transaction) || transaction == null)
+            {
+                transaction = new PendingClaimTransaction
+                {
+                    TransactionId = Guid.NewGuid().ToString("N"),
+                    PlayerId = playerId,
+                    PlayerName = playerName,
+                    ServerName = serverName,
+                    Site = site,
+                    NotifyPlayer = notifyPlayer,
+                    Attempts = 0,
+                    State = ClaimStateCreated,
+                    HadAmbiguousFailure = false,
+                    TargetVoteCount = 0
+                };
+
+                pendingClaimTransactions[pendingClaimKey] = transaction;
+            }
+            else
+            {
+                transaction.PlayerName = playerName;
+                transaction.NotifyPlayer |= notifyPlayer;
+
+                if (string.Equals(transaction.State, ClaimStateManualReview, StringComparison.Ordinal))
+                {
+                    transaction.Attempts = 0;
+                    transaction.State = ClaimStateCreated;
+                    transaction.HadAmbiguousFailure = false;
+                }
+            }
+
+            SavePendingClaimsData();
+            QueuePendingClaimTransaction(pendingClaimKey);
+        }
+
+        private void QueuePendingClaimTransaction(string pendingClaimKey)
+        {
+            PendingClaimTransaction transaction;
+            if (!pendingClaimTransactions.TryGetValue(pendingClaimKey, out transaction) || transaction == null)
+            {
+                pendingClaimTransactions.Remove(pendingClaimKey);
+                SavePendingClaimsData();
+                return;
+            }
+
+            if (string.IsNullOrEmpty(transaction.TransactionId))
+            {
+                transaction.TransactionId = Guid.NewGuid().ToString("N");
+                SavePendingClaimsData();
+            }
+
+            if (string.Equals(transaction.State, ClaimStateConfirmed, StringComparison.Ordinal))
+            {
+                FinalizeConfirmedClaimTransaction(pendingClaimKey, transaction.TransactionId);
+                return;
+            }
+
+            if (string.Equals(transaction.State, ClaimStateManualReview, StringComparison.Ordinal))
             {
                 return;
             }
 
-            string pendingClaimKey = $"{player.UserIDString}:{serverName}:{site}";
-            if (!pendingClaims.Add(pendingClaimKey))
+            if (transaction.Attempts >= MaximumClaimAttempts)
             {
-                _Debug($"A claim request is already pending for {player.displayName}/{player.UserIDString} on {site} ({serverName}).");
+                transaction.State = ClaimStateManualReview;
+                SavePendingClaimsData();
+                ConsoleError($"Claim transaction {transaction.TransactionId} for {transaction.PlayerName}/{transaction.PlayerId} on {transaction.Site} reached the retry limit and requires manual review.");
                 return;
             }
 
+            string claimUrl;
+            if (!TryBuildClaimUrl(transaction, out claimUrl))
+            {
+                transaction.State = ClaimStateManualReview;
+                SavePendingClaimsData();
+                ConsoleError($"Unable to rebuild the claim URL for {transaction.PlayerName}/{transaction.PlayerId} on {transaction.Site} ({transaction.ServerName}). The transaction requires manual review.");
+                return;
+            }
+
+            string requestToken = $"{pendingClaimKey}:{transaction.TransactionId}";
+            if (!pendingClaims.Add(requestToken))
+            {
+                _Debug($"A claim request is already pending for {transaction.PlayerName}/{transaction.PlayerId} on {transaction.Site} ({transaction.ServerName}).");
+                return;
+            }
+
+            scheduledClaimRetries.Remove(pendingClaimKey);
             _Debug($"Automatic claim URL: {MaskApiUrl(claimUrl)}");
 
             QueueVoteRequest(() =>
             {
+                PendingClaimTransaction currentTransaction;
+                if (!TryGetActiveClaimTransaction(pendingClaimKey, transaction.TransactionId, out currentTransaction))
+                {
+                    pendingClaims.Remove(requestToken);
+                    return;
+                }
+
+                currentTransaction.Attempts++;
+                currentTransaction.State = ClaimStateSent;
+                SavePendingClaimsData();
+
                 try
                 {
-                    webrequest.Enqueue(claimUrl, null,
-                        (code, response) => HandleClaimWebRequestCallback(code, response, player, claimUrl, serverName, site, notifyPlayer, pendingClaimKey), this,
-                        RequestMethod.GET, null, 5000);
+                    webrequest.Enqueue(
+                        claimUrl,
+                        null,
+                        (code, response) => HandleClaimWebRequestCallback(code, response, pendingClaimKey, currentTransaction.TransactionId, requestToken),
+                        this,
+                        RequestMethod.GET,
+                        null,
+                        VoteApiRequestTimeout);
                 }
                 catch (Exception exception)
                 {
-                    pendingClaims.Remove(pendingClaimKey);
-                    ConsoleError($"Failed to enqueue the claim request for {player.displayName}/{player.UserIDString} on {site}: {exception.Message}");
+                    pendingClaims.Remove(requestToken);
+
+                    if (TryGetActiveClaimTransaction(pendingClaimKey, currentTransaction.TransactionId, out currentTransaction))
+                    {
+                        currentTransaction.State = ClaimStateUncertain;
+                        currentTransaction.HadAmbiguousFailure = true;
+                        SavePendingClaimsData();
+                    }
+
+                    ConsoleError($"Failed to enqueue the claim request for {transaction.PlayerName}/{transaction.PlayerId} on {transaction.Site}: {exception.Message}");
+                    ScheduleClaimRetry(pendingClaimKey);
                 }
             }, true);
         }
 
+        private bool TryBuildClaimUrl(PendingClaimTransaction transaction, out string claimUrl)
+        {
+            claimUrl = null;
+
+            if (transaction == null || _config.Servers == null)
+            {
+                return false;
+            }
+
+            KeyValuePair<string, Dictionary<string, string>> server = _config.Servers.FirstOrDefault(entry =>
+                entry.Key.Equals(transaction.ServerName, StringComparison.OrdinalIgnoreCase));
+
+            if (string.IsNullOrEmpty(server.Key) || server.Value == null)
+            {
+                return false;
+            }
+
+            KeyValuePair<string, string> configuredVoteSite = server.Value.FirstOrDefault(entry =>
+                entry.Key.Equals(transaction.Site, StringComparison.OrdinalIgnoreCase));
+
+            if (string.IsNullOrEmpty(configuredVoteSite.Key))
+            {
+                return false;
+            }
+
+            string configuredSiteName;
+            Dictionary<string, string> apiConfiguration;
+            string serverId;
+            string serverKey;
+
+            if (!TryGetVoteSiteConfiguration(configuredVoteSite.Key, out configuredSiteName, out apiConfiguration) ||
+                !TryParseServerCredentials(configuredVoteSite.Value, out serverId, out serverKey))
+            {
+                return false;
+            }
+
+            try
+            {
+                claimUrl = FormatApiUrl(
+                    apiConfiguration,
+                    ConfigDefaultKeys.apiClaim,
+                    transaction.PlayerId,
+                    transaction.PlayerName,
+                    serverId,
+                    serverKey);
+                return true;
+            }
+            catch (Exception exception)
+            {
+                ConsoleError($"Failed to format the recovered claim URL for {configuredSiteName} on {server.Key}: {exception.Message}");
+                return false;
+            }
+        }
+
+        private void ScheduleClaimRetry(string pendingClaimKey)
+        {
+            PendingClaimTransaction transaction;
+            if (!pendingClaimTransactions.TryGetValue(pendingClaimKey, out transaction) ||
+                transaction == null ||
+                string.Equals(transaction.State, ClaimStateManualReview, StringComparison.Ordinal) ||
+                !scheduledClaimRetries.Add(pendingClaimKey))
+            {
+                return;
+            }
+
+            if (!string.Equals(transaction.State, ClaimStateConfirmed, StringComparison.Ordinal) &&
+                transaction.Attempts >= MaximumClaimAttempts)
+            {
+                scheduledClaimRetries.Remove(pendingClaimKey);
+                transaction.State = ClaimStateManualReview;
+                SavePendingClaimsData();
+                ConsoleError($"Claim transaction {transaction.TransactionId} for {transaction.PlayerName}/{transaction.PlayerId} on {transaction.Site} reached the retry limit and requires manual review.");
+                return;
+            }
+
+            float retryDelay = string.Equals(transaction.State, ClaimStateConfirmed, StringComparison.Ordinal)
+                ? 10f
+                : (transaction.Attempts <= 3
+                    ? Math.Max(10f, transaction.Attempts * 10f)
+                    : 300f);
+
+            _Debug($"Claim retry for {transaction.PlayerName}/{transaction.PlayerId} on {transaction.Site} scheduled in {retryDelay:0} seconds.");
+
+            timer.Once(retryDelay, () =>
+            {
+                scheduledClaimRetries.Remove(pendingClaimKey);
+
+                if (pendingClaimTransactions.ContainsKey(pendingClaimKey))
+                {
+                    QueuePendingClaimTransaction(pendingClaimKey);
+                }
+            });
+        }
+
+        private void RecoverPendingClaimTransactions()
+        {
+            bool changed = false;
+
+            foreach (KeyValuePair<string, PendingClaimTransaction> entry in pendingClaimTransactions.ToList())
+            {
+                PendingClaimTransaction transaction = entry.Value;
+                if (transaction == null)
+                {
+                    pendingClaimTransactions.Remove(entry.Key);
+                    changed = true;
+                    continue;
+                }
+
+                if (string.IsNullOrEmpty(transaction.TransactionId))
+                {
+                    transaction.TransactionId = Guid.NewGuid().ToString("N");
+                    changed = true;
+                }
+
+                if (string.IsNullOrEmpty(transaction.State))
+                {
+                    transaction.State = transaction.Attempts > 0 ? ClaimStateUncertain : ClaimStateCreated;
+                    transaction.HadAmbiguousFailure = transaction.Attempts > 0;
+                    changed = true;
+                }
+                else if (string.Equals(transaction.State, ClaimStateSent, StringComparison.Ordinal))
+                {
+                    // The server stopped while a request was in flight, so the
+                    // result is ambiguous and a later response 2 may be ours.
+                    transaction.State = ClaimStateUncertain;
+                    transaction.HadAmbiguousFailure = true;
+                    changed = true;
+                }
+            }
+
+            if (changed)
+            {
+                SavePendingClaimsData();
+            }
+
+            foreach (KeyValuePair<string, PendingClaimTransaction> entry in pendingClaimTransactions.ToList())
+            {
+                if (entry.Value == null || string.Equals(entry.Value.State, ClaimStateManualReview, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                QueuePendingClaimTransaction(entry.Key);
+            }
+        }
+
+        private string GetPendingClaimKey(ulong playerId, string serverName, string site)
+        {
+            return $"{playerId}:{serverName}:{site}";
+        }
+
+        private void RemovePendingClaimTransaction(string pendingClaimKey)
+        {
+            scheduledClaimRetries.Remove(pendingClaimKey);
+
+            PendingClaimTransaction transaction;
+            if (pendingClaimTransactions.TryGetValue(pendingClaimKey, out transaction) && transaction != null)
+            {
+                pendingClaims.Remove($"{pendingClaimKey}:{transaction.TransactionId}");
+            }
+
+            if (pendingClaimTransactions.Remove(pendingClaimKey))
+            {
+                SavePendingClaimsData();
+            }
+        }
+
+        private BasePlayer FindPlayer(ulong playerId)
+        {
+            return BasePlayer.FindByID(playerId) ?? BasePlayer.FindSleeping(playerId);
+        }
+
+        private string GetResolvedPlayerName(BasePlayer player, string fallbackName, string steamId)
+        {
+            if (player != null && !string.IsNullOrWhiteSpace(player.displayName))
+            {
+                return player.displayName;
+            }
+
+            return string.IsNullOrWhiteSpace(fallbackName) ? steamId : fallbackName;
+        }
+
         private string FormatApiUrl(Dictionary<string, string> apiConfiguration, string apiKey, BasePlayer player, string serverId, string serverKey)
+        {
+            if (player == null)
+            {
+                throw new ArgumentNullException(nameof(player));
+            }
+
+            return FormatApiUrl(apiConfiguration, apiKey, player.userID, player.displayName, serverId, serverKey);
+        }
+
+        private string FormatApiUrl(Dictionary<string, string> apiConfiguration, string apiKey, ulong playerId, string playerName, string serverId, string serverKey)
         {
             string apiLink = apiConfiguration[apiKey];
             bool usernameApiEnabled = apiConfiguration[ConfigDefaultKeys.apiUsername].ToBool();
             string encodedServerKey = Uri.EscapeDataString(serverKey);
             string encodedServerId = Uri.EscapeDataString(serverId);
             string encodedPlayerIdentifier = usernameApiEnabled
-                ? Uri.EscapeDataString(player.displayName ?? string.Empty)
-                : player.UserIDString;
+                ? Uri.EscapeDataString(playerName ?? string.Empty)
+                : playerId.ToString();
 
             // Extra format arguments are ignored when the URL does not use them.
-            // This allows every built-in or custom tracker to use:
             // {0} = API key/token, {1} = Steam ID or username, {2} = server ID.
             return string.Format(apiLink, encodedServerKey, encodedPlayerIdentifier, encodedServerId);
         }
@@ -400,68 +951,11 @@ namespace Oxide.Plugins
                 return url;
             }
 
-            string maskedUrl = url;
-            string[] sensitiveParameters = { "key=", "server_token=", "token=" };
-
-            foreach (string parameter in sensitiveParameters)
-            {
-                int searchIndex = 0;
-
-                while (searchIndex < maskedUrl.Length)
-                {
-                    int parameterIndex = maskedUrl.IndexOf(parameter, searchIndex, StringComparison.OrdinalIgnoreCase);
-                    if (parameterIndex < 0)
-                    {
-                        break;
-                    }
-
-                    int valueStart = parameterIndex + parameter.Length;
-                    int valueEnd = maskedUrl.IndexOf('&', valueStart);
-                    if (valueEnd < 0)
-                    {
-                        valueEnd = maskedUrl.Length;
-                    }
-
-                    maskedUrl = maskedUrl.Substring(0, valueStart) + "********" + maskedUrl.Substring(valueEnd);
-                    searchIndex = valueStart + 8;
-                }
-            }
-
-            return maskedUrl;
-        }
-
-        private bool HandleVoteCount(BasePlayer player)
-        {
-            if (player == null)
-            {
-                return false;
-            }
-
-            _Debug("------------------------------");
-            _Debug("Method: HandleVoteCount");
-            _Debug($"Player: {player.displayName}/{player.UserIDString}");
-
-            int playerVoteCount = GetStoredVoteCount(player.UserIDString);
-            _Debug($"Current VoteCount: {playerVoteCount}");
-
-            playerVoteCount += 1;
-            DataFile[player.UserIDString] = playerVoteCount;
-            SaveDataFile(DataFile);
-            _Debug($"Updated Vote Count: {playerVoteCount}");
-
-            bool cumulativeRewards = _config.PluginSettings[ConfigDefaultKeys.RewardIsCumulative].ToBool();
-            bool rewardConfigured = HasConfiguredRewardForVote(playerVoteCount, cumulativeRewards);
-
-            if (cumulativeRewards)
-            {
-                GiveCumulativeRewards(player, playerVoteCount);
-            }
-            else
-            {
-                GiveNormalRewards(player, playerVoteCount);
-            }
-
-            return rewardConfigured;
+            return Regex.Replace(
+                url,
+                @"([?&][^=&]*(?:key|token|secret|auth|password)[^=&]*=)[^&]*",
+                "$1********",
+                RegexOptions.IgnoreCase);
         }
 
         private int GetStoredVoteCount(string steamId)
@@ -484,60 +978,112 @@ namespace Oxide.Plugins
             }
         }
 
-        private void GiveCumulativeRewards(BasePlayer player, int playerVoteCount)
+        private List<string> BuildRewardCommands(ulong playerId, string playerName, int playerVoteCount, bool cumulativeRewards)
         {
-            _Debug("------------------------------");
-            _Debug("Method: GiveCumulativeRewards");
-            _Debug($"Player: {player.displayName}/{player.UserIDString}");
+            List<string> commands = new List<string>();
+            string steamId = playerId.ToString();
 
-            GiveEveryReward(player);
+            AddRewardCommands(commands, "@", steamId, playerName);
 
             if (playerVoteCount == 1)
             {
-                GiveFirstReward(player);
+                AddRewardCommands(commands, "first", steamId, playerName);
             }
 
-            foreach (KeyValuePair<string, List<string>> rewards in _config.Rewards)
+            foreach (KeyValuePair<string, List<string>> reward in _config.Rewards)
             {
                 int requiredVoteCount;
-                if (!TryGetNumericRewardVoteCount(rewards.Key, out requiredVoteCount))
+                if (!TryGetNumericRewardVoteCount(reward.Key, out requiredVoteCount))
                 {
                     continue;
                 }
 
-                if (requiredVoteCount <= playerVoteCount)
+                if (cumulativeRewards ? requiredVoteCount <= playerVoteCount : requiredVoteCount == playerVoteCount)
                 {
-                    GiveSubsequentReward(player, rewards.Value);
+                    AddRewardCommands(commands, reward.Key, steamId, playerName);
+                }
+            }
+
+            return commands;
+        }
+
+        private void AddRewardCommands(List<string> destination, string rewardKey, string steamId, string playerName)
+        {
+            List<string> configuredCommands;
+            if (destination == null ||
+                !_config.Rewards.TryGetValue(rewardKey, out configuredCommands) ||
+                configuredCommands == null)
+            {
+                return;
+            }
+
+            foreach (string configuredCommand in configuredCommands)
+            {
+                if (string.IsNullOrWhiteSpace(configuredCommand))
+                {
+                    continue;
+                }
+
+                string command = ParseRewardCommand(steamId, playerName, configuredCommand);
+                if (!string.IsNullOrWhiteSpace(command))
+                {
+                    destination.Add(command);
                 }
             }
         }
 
-        private void GiveNormalRewards(BasePlayer player, int playerVoteCount)
+        private bool QueuePendingRewardTransaction(string steamId, string transactionId, List<string> commands)
         {
-            _Debug("------------------------------");
-            _Debug("Method: GiveNormalRewards");
-            _Debug($"Player: {player.displayName}/{player.UserIDString}");
-
-            GiveEveryReward(player);
-
-            if (playerVoteCount == 1)
+            if (string.IsNullOrWhiteSpace(steamId) ||
+                string.IsNullOrWhiteSpace(transactionId) ||
+                commands == null ||
+                commands.Count == 0)
             {
-                GiveFirstReward(player);
+                return false;
             }
 
-            foreach (KeyValuePair<string, List<string>> rewards in _config.Rewards)
+            List<string> pendingCommands;
+            if (!pendingRewardCommands.TryGetValue(steamId, out pendingCommands) || pendingCommands == null)
             {
-                int requiredVoteCount;
-                if (!TryGetNumericRewardVoteCount(rewards.Key, out requiredVoteCount))
+                pendingCommands = new List<string>();
+                pendingRewardCommands[steamId] = pendingCommands;
+            }
+
+            string marker = GetPendingRewardTransactionMarker(transactionId);
+            if (pendingCommands.Contains(marker))
+            {
+                return true;
+            }
+
+            int originalCount = pendingCommands.Count;
+            pendingCommands.Add(marker);
+            pendingCommands.AddRange(commands.Where(command => !string.IsNullOrWhiteSpace(command)));
+
+            if (!SavePendingRewardsData())
+            {
+                pendingCommands.RemoveRange(originalCount, pendingCommands.Count - originalCount);
+
+                if (pendingCommands.Count == 0)
                 {
-                    continue;
+                    pendingRewardCommands.Remove(steamId);
                 }
 
-                if (requiredVoteCount == playerVoteCount)
-                {
-                    GiveSubsequentReward(player, rewards.Value);
-                }
+                return false;
             }
+
+            _Debug($"Queued {commands.Count} pending reward command(s) for {steamId}, transaction {transactionId}.");
+            return true;
+        }
+
+        private string GetPendingRewardTransactionMarker(string transactionId)
+        {
+            return PendingRewardTransactionPrefix + transactionId;
+        }
+
+        private bool IsPendingRewardTransactionMarker(string value)
+        {
+            return !string.IsNullOrEmpty(value) &&
+                   value.StartsWith(PendingRewardTransactionPrefix, StringComparison.Ordinal);
         }
 
         private bool TryGetNumericRewardVoteCount(string rewardKey, out int requiredVoteCount)
@@ -548,39 +1094,6 @@ namespace Oxide.Plugins
         private bool HasRewardCommands(List<string> rewardCommands)
         {
             return rewardCommands != null && rewardCommands.Any(command => !string.IsNullOrWhiteSpace(command));
-        }
-
-        private bool HasConfiguredRewardForVote(int playerVoteCount, bool cumulativeRewards)
-        {
-            List<string> rewardCommands;
-
-            if (_config.Rewards.TryGetValue("@", out rewardCommands) && HasRewardCommands(rewardCommands))
-            {
-                return true;
-            }
-
-            if (playerVoteCount == 1 &&
-                _config.Rewards.TryGetValue("first", out rewardCommands) &&
-                HasRewardCommands(rewardCommands))
-            {
-                return true;
-            }
-
-            foreach (KeyValuePair<string, List<string>> reward in _config.Rewards)
-            {
-                int requiredVoteCount;
-                if (!TryGetNumericRewardVoteCount(reward.Key, out requiredVoteCount) || !HasRewardCommands(reward.Value))
-                {
-                    continue;
-                }
-
-                if (cumulativeRewards ? requiredVoteCount <= playerVoteCount : requiredVoteCount == playerVoteCount)
-                {
-                    return true;
-                }
-            }
-
-            return false;
         }
 
         private string GetRewardDescription(string rewardKey, string playerId)
@@ -610,125 +1123,84 @@ namespace Oxide.Plugins
             return TryGetNumericRewardVoteCount(rewardKey, out requiredVoteCount) ? requiredVoteCount : int.MaxValue;
         }
 
-        private void GiveEveryReward(BasePlayer player)
+        private bool DeliverPendingRewards(BasePlayer player, bool notifyPlayer = true)
         {
-            _Debug("------------------------------");
-            _Debug("Method: GiveEveryReward");
-            _Debug($"Player: {player.displayName}/{player.UserIDString}");
-
-            List<string> rewards;
-            if (!_config.Rewards.TryGetValue("@", out rewards) || rewards == null)
+            if (player == null || !player.IsConnected || player.IsSleeping())
             {
-                return;
-            }
-
-            foreach (string rewardCommand in rewards)
-            {
-                RunOrQueueRewardCommand(player, rewardCommand);
-            }
-        }
-
-        private void GiveFirstReward(BasePlayer player)
-        {
-            _Debug("------------------------------");
-            _Debug("Method: GiveFirstReward");
-            _Debug($"Player: {player.displayName}/{player.UserIDString}");
-
-            List<string> rewards;
-            if (!_config.Rewards.TryGetValue("first", out rewards) || rewards == null)
-            {
-                return;
-            }
-
-            foreach (string rewardCommand in rewards)
-            {
-                RunOrQueueRewardCommand(player, rewardCommand);
-            }
-        }
-
-        private void GiveSubsequentReward(BasePlayer player, List<string> rewardsList)
-        {
-            _Debug("------------------------------");
-            _Debug("Method: GiveSubsequentReward");
-            _Debug($"Player: {player.displayName}/{player.UserIDString}");
-            _Debug($"Vote Count: {GetStoredVoteCount(player.UserIDString)}");
-
-            if (rewardsList == null)
-            {
-                return;
-            }
-
-            foreach (string rewardCommand in rewardsList)
-            {
-                RunOrQueueRewardCommand(player, rewardCommand);
-            }
-        }
-
-        private void RunOrQueueRewardCommand(BasePlayer player, string rewardCommand)
-        {
-            if (player == null || string.IsNullOrWhiteSpace(rewardCommand))
-            {
-                return;
-            }
-
-            string command = ParseRewardCommand(player, rewardCommand);
-            _Debug($"Reward Command: {command}");
-
-            if (player.IsConnected)
-            {
-                rust.RunServerCommand(command);
-                return;
-            }
-
-            QueuePendingRewardCommand(player.UserIDString, command);
-        }
-
-        private void QueuePendingRewardCommand(string steamId, string command)
-        {
-            List<string> commands;
-            if (!pendingRewardCommands.TryGetValue(steamId, out commands))
-            {
-                commands = new List<string>();
-                pendingRewardCommands[steamId] = commands;
-            }
-
-            commands.Add(command);
-            SavePendingRewardsData();
-            _Debug($"Queued a pending reward command for {steamId}: {command}");
-        }
-
-        private void DeliverPendingRewards(BasePlayer player)
-        {
-            if (player == null || !player.IsConnected)
-            {
-                return;
+                return false;
             }
 
             List<string> commands;
             if (!pendingRewardCommands.TryGetValue(player.UserIDString, out commands) || commands == null || commands.Count == 0)
             {
-                return;
+                return false;
             }
 
-            List<string> commandsToRun = commands.ToList();
+            bool deliveredCommand = false;
 
-            foreach (string command in commandsToRun)
+            while (pendingRewardCommands.TryGetValue(player.UserIDString, out commands) &&
+                   commands != null &&
+                   commands.Count > 0)
             {
+                string command = commands[0];
+                commands.RemoveAt(0);
+
+                bool removedPlayerEntry = commands.Count == 0;
+                if (removedPlayerEntry)
+                {
+                    pendingRewardCommands.Remove(player.UserIDString);
+                }
+
+                // Persist removal before execution. This gives at-most-once delivery
+                // across crashes and prevents a command from being replayed after it
+                // has already been dispatched to the server console.
+                if (!SavePendingRewardsData())
+                {
+                    if (removedPlayerEntry)
+                    {
+                        pendingRewardCommands[player.UserIDString] = commands;
+                    }
+
+                    commands.Insert(0, command);
+                    return deliveredCommand;
+                }
+
+                if (IsPendingRewardTransactionMarker(command))
+                {
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(command))
+                {
+                    continue;
+                }
+
                 _Debug($"Delivering pending reward command to {player.displayName}/{player.UserIDString}: {command}");
                 rust.RunServerCommand(command);
+                deliveredCommand = true;
             }
 
-            pendingRewardCommands.Remove(player.UserIDString);
-            SavePendingRewardsData();
+            if (deliveredCommand && notifyPlayer)
+            {
+                player.ChatMessage(_lang("PendingRewardsDelivered", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix]));
+            }
 
-            player.ChatMessage(_lang("PendingRewardsDelivered", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix]));
+            return deliveredCommand;
         }
 
-        private string ParseRewardCommand(BasePlayer player, string command)
+        private string ParseRewardCommand(string steamId, string playerName, string command)
         {
+            string safePlayerName = string.IsNullOrWhiteSpace(playerName)
+                ? steamId
+                : playerName
+                    .Replace("\r", " ")
+                    .Replace("\n", " ")
+                    .Replace(";", string.Empty)
+                    .Replace("\"", "'");
+
             return command
-                .Replace("{playerid}", player.UserIDString)
-                .Replace("{playername}", player.displayName);
+                .Replace("{playerid}", steamId)
+                .Replace("{playername}", safePlayerName);
         }
 
         private void CheckIfPlayerDataExists(BasePlayer player)
@@ -760,6 +1232,26 @@ namespace Oxide.Plugins
             }
 
             SaveDataFile(DataFile);
+
+            pendingStatusChecks.Clear();
+            statusRequestTokens.Clear();
+            voteRequestQueue.Clear();
+
+            if (pendingRewardCommands.Count > 0)
+            {
+                pendingRewardCommands.Clear();
+                SavePendingRewardsData();
+                _Debug("All pending vote rewards have been cleared together with the vote data.");
+            }
+
+            if (pendingClaimTransactions.Count > 0)
+            {
+                pendingClaimTransactions.Clear();
+                pendingClaims.Clear();
+                scheduledClaimRetries.Clear();
+                SavePendingClaimsData();
+                _Debug("All pending vote claim transactions have been cleared together with the vote data.");
+            }
         }
 
         private void WarnConfigurationOnce(string warningKey, string message)
@@ -781,10 +1273,7 @@ namespace Oxide.Plugins
             _Debug("Method: CheckVotingStatus");
             _Debug($"Player: {player.displayName}/{player.UserIDString}");
 
-            if (notifyPlayer && _config.NotificationSettings[ConfigDefaultKeys.PleaseWaitMessage].ToBool())
-            {
-                player.ChatMessage(_lang("PleaseWait", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix]));
-            }
+            bool waitMessageSent = false;
 
             foreach (KeyValuePair<string, Dictionary<string, string>> server in _config.Servers)
             {
@@ -829,18 +1318,57 @@ namespace Oxide.Plugins
                         continue;
                     }
 
-                    BasePlayer requestPlayer = player;
+                    ulong requestPlayerId = player.userID;
+                    string requestPlayerName = player.displayName;
+                    string requestPlayerSteamId = player.UserIDString;
                     string requestServerName = server.Key;
                     string requestSiteName = configuredSiteName;
                     string statusUrl = formattedStatusUrl;
                     string claimUrl = formattedClaimUrl;
                     bool requestNotifyPlayer = notifyPlayer;
-                    string pendingStatusKey = $"{requestPlayer.UserIDString}:{requestServerName}:{requestSiteName}";
+                    string pendingStatusKey = $"{requestPlayerSteamId}:{requestServerName}:{requestSiteName}";
+                    string pendingClaimKey = GetPendingClaimKey(requestPlayerId, requestServerName, requestSiteName);
+                    PendingClaimTransaction existingClaimTransaction;
+
+                    if (pendingClaimTransactions.TryGetValue(pendingClaimKey, out existingClaimTransaction) &&
+                        existingClaimTransaction != null)
+                    {
+                        if (string.Equals(existingClaimTransaction.State, ClaimStateManualReview, StringComparison.Ordinal))
+                        {
+                            WarnConfigurationOnce(
+                                $"manual-claim-review:{pendingClaimKey}",
+                                $"Claim transaction {existingClaimTransaction.TransactionId} for {requestPlayerName}/{requestPlayerSteamId} on {requestSiteName} reached the retry limit. It was released so normal status checks can continue.");
+                            RemovePendingClaimTransaction(pendingClaimKey);
+                        }
+                        else
+                        {
+                            if (string.Equals(existingClaimTransaction.State, ClaimStateConfirmed, StringComparison.Ordinal))
+                            {
+                                FinalizeConfirmedClaimTransaction(pendingClaimKey, existingClaimTransaction.TransactionId);
+                            }
+                            else
+                            {
+                                QueuePendingClaimTransaction(pendingClaimKey);
+                            }
+
+                            _Debug($"Skipping a duplicate status request because a claim transaction already exists for {requestPlayerName}/{requestPlayerSteamId} on {requestSiteName} ({requestServerName}).");
+                            continue;
+                        }
+                    }
 
                     if (!pendingStatusChecks.Add(pendingStatusKey))
                     {
-                        _Debug($"A status request is already pending for {requestPlayer.displayName}/{requestPlayer.UserIDString} on {requestSiteName} ({requestServerName}).");
+                        _Debug($"A status request is already pending for {requestPlayerName}/{requestPlayerSteamId} on {requestSiteName} ({requestServerName}).");
                         continue;
+                    }
+
+                    string statusRequestToken = Guid.NewGuid().ToString("N");
+                    statusRequestTokens[pendingStatusKey] = statusRequestToken;
+
+                    if (!waitMessageSent && notifyPlayer && _config.NotificationSettings[ConfigDefaultKeys.PleaseWaitMessage].ToBool())
+                    {
+                        player.ChatMessage(_lang("PleaseWait", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix]));
+                        waitMessageSent = true;
                     }
 
                     _Debug($"Status URL: {MaskApiUrl(statusUrl)}");
@@ -848,22 +1376,28 @@ namespace Oxide.Plugins
 
                     QueueVoteRequest(() =>
                     {
-                        if (requestPlayer == null || !requestPlayer.IsConnected)
+                        if (!IsActiveStatusRequest(pendingStatusKey, statusRequestToken))
                         {
-                            pendingStatusChecks.Remove(pendingStatusKey);
+                            return;
+                        }
+
+                        BasePlayer currentPlayer = BasePlayer.FindByID(requestPlayerId);
+                        if (currentPlayer == null || !currentPlayer.IsConnected)
+                        {
+                            CancelStatusRequest(pendingStatusKey, statusRequestToken);
                             return;
                         }
 
                         try
                         {
                             webrequest.Enqueue(statusUrl, null,
-                                (code, response) => HandleStatusWebRequestCallback(code, response, requestPlayer, statusUrl, claimUrl, requestServerName, requestSiteName, requestNotifyPlayer, pendingStatusKey), this,
-                                RequestMethod.GET, null, 5000);
+                                (code, response) => HandleStatusWebRequestCallback(code, response, requestPlayerId, requestPlayerName, statusUrl, requestServerName, requestSiteName, requestNotifyPlayer, pendingStatusKey, statusRequestToken), this,
+                                RequestMethod.GET, null, VoteApiRequestTimeout);
                         }
                         catch (Exception exception)
                         {
-                            pendingStatusChecks.Remove(pendingStatusKey);
-                            ConsoleError($"Failed to enqueue the status request for {requestPlayer.displayName}/{requestPlayer.UserIDString} on {requestSiteName}: {exception.Message}");
+                            CancelStatusRequest(pendingStatusKey, statusRequestToken);
+                            ConsoleError($"Failed to enqueue the status request for {requestPlayerName}/{requestPlayerSteamId} on {requestSiteName}: {exception.Message}");
                         }
                     });
                 }
@@ -938,18 +1472,25 @@ namespace Oxide.Plugins
         private void ScheduleVoteFollowUpCheck(BasePlayer player)
         {
             int delay = GetVoteFollowUpCheckDelay();
-            if (delay <= 0 || player == null || !scheduledVoteChecks.Add(player.userID))
+            if (delay <= 0 || player == null)
+            {
+                return;
+            }
+
+            ulong playerId = player.userID;
+            if (!scheduledVoteChecks.Add(playerId))
             {
                 return;
             }
 
             timer.Once(delay, () =>
             {
-                scheduledVoteChecks.Remove(player.userID);
+                scheduledVoteChecks.Remove(playerId);
 
-                if (player != null && player.IsConnected)
+                BasePlayer currentPlayer = BasePlayer.FindByID(playerId);
+                if (currentPlayer != null && currentPlayer.IsConnected)
                 {
-                    CheckVotingStatus(player, false);
+                    CheckVotingStatus(currentPlayer, false);
                 }
             });
         }
@@ -1052,7 +1593,7 @@ namespace Oxide.Plugins
             Debug.LogWarning($"WARNING: {message}");
         }
 
-        protected void _Debug(string message, string arg = null)
+        protected void _Debug(string message)
         {
             string debugSetting;
             bool debugEnabled;
@@ -1072,11 +1613,6 @@ namespace Oxide.Plugins
             }
 
             Puts($"DEBUG: {message}");
-
-            if (arg != null)
-            {
-                Puts($"DEBUG ARG: {arg}");
-            }
         }
 
         private IEnumerator DiscordSendMessage(string msg)
@@ -1172,6 +1708,8 @@ namespace Oxide.Plugins
 
             player.ChatMessage(_lang("VoteList", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix]));
 
+            bool displayedVoteLink = false;
+
             foreach (KeyValuePair<string, Dictionary<string, string>> server in _config.Servers)
             {
                 if (server.Value == null)
@@ -1183,6 +1721,7 @@ namespace Oxide.Plugins
                 if (_config.ServersCustomLink.TryGetValue(server.Key, out customLink) && !string.IsNullOrWhiteSpace(customLink))
                 {
                     player.ChatMessage(_lang("VoteLinkCustom", player.UserIDString, server.Key, customLink));
+                    displayedVoteLink = true;
                     continue;
                 }
 
@@ -1212,7 +1751,14 @@ namespace Oxide.Plugins
                     }
 
                     player.ChatMessage(_lang("VoteLink", player.UserIDString, server.Key, configuredSiteName, voteLink));
+                    displayedVoteLink = true;
                 }
+            }
+
+            if (!displayedVoteLink)
+            {
+                player.ChatMessage(_lang("NoVoteSitesConfigured", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix]));
+                return;
             }
 
             player.ChatMessage(_lang("EarnRewardAutomatic", player.UserIDString));
@@ -1256,16 +1802,48 @@ namespace Oxide.Plugins
             }
 
             string targetInput = arg.GetString(0);
-            BasePlayer player = arg.GetPlayer(0);
-            if (player == null)
+            string steamId;
+            string targetLabel;
+
+            if (!TryResolveConsoleTarget(targetInput, out steamId, out targetLabel))
             {
                 ReplyConsoleLocalized(arg, "ConsolePlayerNotFound", targetInput);
                 return;
             }
 
-            DataFile[player.UserIDString] = 0;
+            DataFile[steamId] = 0;
             SaveDataFile(DataFile);
-            ReplyConsoleLocalized(arg, "ConsoleClearVoteSuccess", FormatPlayerForConsole(player));
+            CancelStatusRequestsForPlayer(steamId);
+
+            if (pendingRewardCommands.Remove(steamId))
+            {
+                SavePendingRewardsData();
+            }
+
+            bool pendingClaimsRemoved = false;
+            foreach (string pendingClaimKey in pendingClaimTransactions
+                .Where(entry => entry.Value != null && entry.Value.PlayerId.ToString() == steamId)
+                .Select(entry => entry.Key)
+                .ToList())
+            {
+                PendingClaimTransaction transaction = pendingClaimTransactions[pendingClaimKey];
+                pendingClaimTransactions.Remove(pendingClaimKey);
+
+                if (transaction != null && !string.IsNullOrEmpty(transaction.TransactionId))
+                {
+                    pendingClaims.Remove($"{pendingClaimKey}:{transaction.TransactionId}");
+                }
+
+                scheduledClaimRetries.Remove(pendingClaimKey);
+                pendingClaimsRemoved = true;
+            }
+
+            if (pendingClaimsRemoved)
+            {
+                SavePendingClaimsData();
+            }
+
+            ReplyConsoleLocalized(arg, "ConsoleClearVoteSuccess", targetLabel);
         }
 
         [ConsoleCommand("eve.checkvote")]
@@ -1283,14 +1861,20 @@ namespace Oxide.Plugins
             }
 
             string targetInput = arg.GetString(0);
-            BasePlayer player = arg.GetPlayer(0);
-            if (player == null)
+            string steamId;
+            string targetLabel;
+
+            if (!TryResolveConsoleTarget(targetInput, out steamId, out targetLabel))
             {
                 ReplyConsoleLocalized(arg, "ConsolePlayerNotFound", targetInput);
                 return;
             }
 
-            ReplyConsoleLocalized(arg, "ConsoleCheckVoteSuccess", FormatPlayerForConsole(player), getPlayerVotes(player.UserIDString));
+            ReplyConsoleLocalized(
+                arg,
+                "ConsoleCheckVoteSuccess",
+                targetLabel,
+                getPlayerVotes(steamId));
         }
 
         [ConsoleCommand("eve.setvote")]
@@ -1308,8 +1892,10 @@ namespace Oxide.Plugins
             }
 
             string targetInput = arg.GetString(0);
-            BasePlayer player = arg.GetPlayer(0);
-            if (player == null)
+            string steamId;
+            string targetLabel;
+
+            if (!TryResolveConsoleTarget(targetInput, out steamId, out targetLabel))
             {
                 ReplyConsoleLocalized(arg, "ConsolePlayerNotFound", targetInput);
                 return;
@@ -1322,9 +1908,14 @@ namespace Oxide.Plugins
                 return;
             }
 
-            DataFile[player.UserIDString] = voteCount;
+            DataFile[steamId] = voteCount;
             SaveDataFile(DataFile);
-            ReplyConsoleLocalized(arg, "ConsoleSetVoteSuccess", FormatPlayerForConsole(player), voteCount);
+
+            ReplyConsoleLocalized(
+                arg,
+                "ConsoleSetVoteSuccess",
+                targetLabel,
+                voteCount);
         }
 
         [ConsoleCommand("eve.resetvotedata")]
@@ -1344,6 +1935,101 @@ namespace Oxide.Plugins
             int resetPlayers = DataFile.ToList().Count;
             ResetAllVoteData();
             ReplyConsoleLocalized(arg, "ConsoleResetVoteDataSuccess", resetPlayers);
+        }
+
+        private bool TryResolveConsoleTarget(string targetInput, out string steamId, out string targetLabel)
+        {
+            steamId = null;
+            targetLabel = null;
+
+            if (string.IsNullOrWhiteSpace(targetInput))
+            {
+                return false;
+            }
+
+            targetInput = targetInput.Trim();
+
+            if (targetInput.Length >= 2 &&
+                ((targetInput[0] == '"' && targetInput[targetInput.Length - 1] == '"') ||
+                 (targetInput[0] == '\'' && targetInput[targetInput.Length - 1] == '\'')))
+            {
+                targetInput = targetInput.Substring(1, targetInput.Length - 2).Trim();
+            }
+
+            if (string.IsNullOrWhiteSpace(targetInput))
+            {
+                return false;
+            }
+
+            ulong playerId;
+            if (ulong.TryParse(targetInput, out playerId))
+            {
+                if (!IsValidSteamId(playerId))
+                {
+                    return false;
+                }
+                steamId = playerId.ToString();
+
+                BasePlayer knownPlayer =
+                    BasePlayer.FindByID(playerId) ??
+                    BasePlayer.FindSleeping(playerId);
+
+                targetLabel = knownPlayer != null
+                    ? FormatPlayerForConsole(knownPlayer)
+                    : steamId;
+
+                return true;
+            }
+
+            List<BasePlayer> exactMatches = BasePlayer.activePlayerList
+                .Concat(BasePlayer.sleepingPlayerList)
+                .Where(player =>
+                    player != null &&
+                    !string.IsNullOrEmpty(player.displayName) &&
+                    player.displayName.Equals(
+                        targetInput,
+                        StringComparison.OrdinalIgnoreCase))
+                .GroupBy(player => player.userID)
+                .Select(group => group.First())
+                .ToList();
+
+            BasePlayer matchedPlayer =
+                exactMatches.Count == 1 ? exactMatches[0] : null;
+
+            if (matchedPlayer == null && exactMatches.Count == 0)
+            {
+                List<BasePlayer> partialMatches = BasePlayer.activePlayerList
+                    .Concat(BasePlayer.sleepingPlayerList)
+                    .Where(player =>
+                        player != null &&
+                        !string.IsNullOrEmpty(player.displayName) &&
+                        player.displayName.IndexOf(
+                            targetInput,
+                            StringComparison.OrdinalIgnoreCase) >= 0)
+                    .GroupBy(player => player.userID)
+                    .Select(group => group.First())
+                    .Take(2)
+                    .ToList();
+
+                if (partialMatches.Count == 1)
+                {
+                    matchedPlayer = partialMatches[0];
+                }
+            }
+
+            if (matchedPlayer == null)
+            {
+                return false;
+            }
+
+            steamId = matchedPlayer.UserIDString;
+            targetLabel = FormatPlayerForConsole(matchedPlayer);
+            return true;
+        }
+
+        private bool IsValidSteamId(ulong playerId)
+        {
+            return playerId >= 76561197960265728UL && playerId.ToString().Length == 17;
         }
 
         private bool EnsureServerConsoleCommand(ConsoleSystem.Arg arg, string command)
@@ -1370,9 +2056,9 @@ namespace Oxide.Plugins
 
         private void ReplyConsoleLocalized(ConsoleSystem.Arg arg, string key, params object[] args)
         {
-            string message = _lang(key, null, args);
+            string message = _langConsole(key, null, args);
 
-            if (arg != null)
+            if (arg != null && arg.Connection != null)
             {
                 arg.ReplyWith(message);
                 return;
@@ -1388,7 +2074,7 @@ namespace Oxide.Plugins
                 return;
             }
 
-            player.SendConsoleCommand("echo", _lang(key, player.UserIDString, args));
+            player.SendConsoleCommand("echo", _langConsole(key, player.UserIDString, args));
         }
 
         ////////////////////////////////////////////////////////////
@@ -1405,13 +2091,41 @@ namespace Oxide.Plugins
 
             try
             {
-                return string.Format(message, args);
+                string formattedMessage = string.Format(message, args);
+
+                // Most chat messages use the first placeholder for the configured prefix.
+                // If the prefix is empty, remove the remaining leading whitespace without
+                // changing messages that use a non-empty prefix or other first argument.
+                if (args != null &&
+                    args.Length > 0 &&
+                    string.IsNullOrWhiteSpace(args[0]?.ToString()))
+                {
+                    return formattedMessage.TrimStart();
+                }
+
+                return formattedMessage;
             }
             catch (FormatException)
             {
                 ConsoleWarn($"Language message '{key}' contains invalid formatting for target '{(id == null ? "server default" : id)}'.");
                 return message;
             }
+        }
+
+        private string _langConsole(string key, string id = null, params object[] args)
+        {
+            return PrepareConsoleMessage(_lang(key, id, args));
+        }
+
+        private string PrepareConsoleMessage(string source)
+        {
+            if (string.IsNullOrEmpty(source))
+            {
+                return source;
+            }
+
+            source = Regex.Replace(source, @"</?(color|size|b|i|material|alpha)(=[^>]+)?>", string.Empty, RegexOptions.IgnoreCase);
+            return source.Replace('<', '‹').Replace('>', '›');
         }
 
         private class ConfigDefaultKeys
@@ -1541,7 +2255,7 @@ namespace Oxide.Plugins
                 { ConfigDefaultKeys.LogEnabled, "true" },
                 { ConfigDefaultKeys.ClearRewardsOnWipe, "false" },
                 { ConfigDefaultKeys.RewardIsCumulative, "false" },
-                { ConfigDefaultKeys.Prefix, "<color=#e67e22>[EasyVote]</color> " }
+                { ConfigDefaultKeys.Prefix, "<color=#e67e22>[EasyVote]</color>" }
             });
 
             if (_config.NotificationSettings == null)
@@ -1884,6 +2598,9 @@ namespace Oxide.Plugins
             {
                 ["CommandCooldown"] = "{0} Please wait <color=#e67e22>{1}</color> second(s) before using this command again.",
                 ["PendingRewardsDelivered"] = "{0} Your pending vote reward(s) have been delivered!",
+                ["ThankYouPending"] = "{0} Thank you for voting! You have voted <color=#e67e22>{1}</color> time(s). Your reward for <color=#e67e22>{2}</color> is pending and will be delivered when you are fully connected.",
+                ["DiscordWebhookMessagePending"] = "{0} has voted for {1} on {2}. The reward is pending and will be delivered when the player reconnects or wakes up.",
+                ["GlobalChatAnnouncementsPending"] = "{0} <color=#e67e22>{1}</color> has voted <color=#e67e22>{2}</color> time(s). Their reward is pending and will be delivered when they are fully connected.",
                 ["ClaimStatus"] = "{0} <color=#e67e22>{1}</color> reports you have not voted yet on <color=#e67e22>{2}</color>. Vote now!",
                 ["PleaseWait"] = "{0} Checking all the vote sites API's... Please be patient as this can take some time...",
                 ["VoteList"] = "{0} You can vote for our server at the following links:",
@@ -1898,6 +2615,7 @@ namespace Oxide.Plugins
                 ["DiscordWebhookMessageNoReward"] = "{0} has voted for {1} on {2}. The vote was recorded successfully.",
                 ["RewardsListHeader"] = "{0} The following rewards are given for voting!",
                 ["NoConfiguredRewards"] = "No vote rewards are currently configured.",
+                ["NoVoteSitesConfigured"] = "{0} No voting sites are currently configured.",
                 ["RewardDescriptionMissing"] = "Description not configured",
                 ["EveryVote"] = "Every Vote: <color=#e67e22>{0}</color>",
                 ["FirstVote"] = "First Vote: <color=#e67e22>{0}</color>",
@@ -1920,6 +2638,9 @@ namespace Oxide.Plugins
             {
                 ["CommandCooldown"] = "{0} Te rugăm să aștepți <color=#e67e22>{1}</color> secunde înainte de a folosi din nou această comandă.",
                 ["PendingRewardsDelivered"] = "{0} Recompensele de vot aflate în așteptare au fost acordate!",
+                ["ThankYouPending"] = "{0} Mulțumim pentru vot! Ai votat de <color=#e67e22>{1}</color> ori. Recompensa pentru <color=#e67e22>{2}</color> este în așteptare și va fi acordată după ce ești conectat complet.",
+                ["DiscordWebhookMessagePending"] = "{0} a votat pentru {1} pe {2}. Recompensa este în așteptare și va fi acordată atunci când jucătorul se reconectează sau se trezește.",
+                ["GlobalChatAnnouncementsPending"] = "{0} <color=#e67e22>{1}</color> a votat de <color=#e67e22>{2}</color> ori. Recompensa este în așteptare și va fi acordată când jucătorul este conectat complet.",
                 ["ClaimStatus"] = "{0} <color=#e67e22>{1}</color> raportează că nu ai votat încă pe <color=#e67e22>{2}</color>. Votează acum!",
                 ["PleaseWait"] = "{0} Se verifică toate API-urile site-urilor de vot... Te rugăm să ai răbdare, acest proces poate dura ceva timp...",
                 ["VoteList"] = "{0} Poți vota pentru server-ul nostru accesând următoarele link-uri:",
@@ -1934,6 +2655,7 @@ namespace Oxide.Plugins
                 ["DiscordWebhookMessageNoReward"] = "{0} a votat pentru {1} pe {2}. Votul a fost înregistrat cu succes.",
                 ["RewardsListHeader"] = "{0} Următoarele recompense sunt acordate pentru vot!",
                 ["NoConfiguredRewards"] = "Momentan nu este configurată nicio recompensă pentru vot.",
+                ["NoVoteSitesConfigured"] = "{0} Momentan nu este configurat niciun site de vot.",
                 ["RewardDescriptionMissing"] = "Descriere neconfigurată",
                 ["EveryVote"] = "Fiecare Vot: <color=#e67e22>{0}</color>",
                 ["FirstVote"] = "Primul Vot: <color=#e67e22>{0}</color>",
@@ -1980,15 +2702,43 @@ namespace Oxide.Plugins
             }
         }
 
-        private void SavePendingRewardsData()
+        private bool SavePendingRewardsData()
         {
             try
             {
                 Interface.Oxide.DataFileSystem.WriteObject(PendingRewardsDataFileName, pendingRewardCommands);
+                return true;
             }
             catch (Exception exception)
             {
                 ConsoleError($"Failed to save pending vote rewards data: {exception.Message}");
+                return false;
+            }
+        }
+
+        private void LoadPendingClaimsData()
+        {
+            try
+            {
+                pendingClaimTransactions = Interface.Oxide.DataFileSystem.ReadObject<Dictionary<string, PendingClaimTransaction>>(PendingClaimsDataFileName) ??
+                                           new Dictionary<string, PendingClaimTransaction>();
+            }
+            catch (Exception exception)
+            {
+                pendingClaimTransactions = new Dictionary<string, PendingClaimTransaction>();
+                ConsoleWarn($"Failed to load pending claim transactions: {exception.Message}");
+            }
+        }
+
+        private void SavePendingClaimsData()
+        {
+            try
+            {
+                Interface.Oxide.DataFileSystem.WriteObject(PendingClaimsDataFileName, pendingClaimTransactions);
+            }
+            catch (Exception exception)
+            {
+                ConsoleError($"Failed to save pending vote claim data: {exception.Message}");
             }
         }
 
@@ -1999,12 +2749,6 @@ namespace Oxide.Plugins
         [HookMethod(nameof(getPlayerVotes))]
         public int getPlayerVotes(string steamID)
         {
-            if (DataFile[steamID] == null)
-            {
-                _Debug("getPlayerVotes(): Player data doesn't exist");
-                return 0;
-            }
-
             return GetStoredVoteCount(steamID);
         }
     }
