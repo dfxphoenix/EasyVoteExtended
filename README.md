@@ -1,7 +1,7 @@
 ## Overview
 **Easy Vote Extended** is an upgraded version of Easy Vote, the most advanced and versatile voting plugin available, designed to enhance player engagement and community interaction effortlessly.
 
-The plugin includes automatic vote claiming, configurable rewards, per-player language support, Discord announcements, multiple-server support, persistent pending rewards, seven built-in voting sites, and support for compatible custom vote trackers.
+The plugin includes automatic vote claiming, configurable rewards, per-player language support, Discord announcements, multiple-server support, persistent pending rewards, claim recovery with administrator review, protected data writes, seven built-in voting sites, and support for compatible custom vote trackers.
 
 A player does not need to run `/claim` after voting. Votes are checked and claimed automatically when the player connects, when the configured sleep-ended check runs, during periodic checks for online players, or shortly after `/vote` is used. The `/claim` command remains available as an optional manual check.
 
@@ -24,10 +24,22 @@ Compatible custom voting sites can also be added through the configuration.
 * `/rewardlist` - Display the currently configured vote rewards.
 
 ## Server Commands
-* `eve.clearvote <steamid|username>` - Reset a player's vote count to `0`.
+* `eve.clearvote <steamid|username>` - Reset a player's vote count to `0` and clear their pending claims and rewards.
 * `eve.checkvote <steamid|username>` - Display a player's current vote count.
 * `eve.setvote <steamid|username> <amount>` - Set a player's vote count to a specific number.
-* `eve.resetvotedata` - Reset all stored vote counts.
+* `eve.resetvotedata` - Reset all stored vote counts and clear all pending claims and rewards.
+* `eve.pending [steamid|username]` - Display pending claim transactions, optionally filtered by player, with their IDs, states and review reasons. Up to 50 entries are shown.
+* `eve.resolve <transactionid> <retry|grant|discard>` - Resolve a claim transaction awaiting manual review.
+
+These commands are available only from the server console or RCON. Use the transaction ID shown by `eve.pending` with `eve.resolve`:
+
+* `retry` - Reset retry counters and resume processing, checking the tracker status first if the previous result was uncertain.
+* `grant` - Confirm the vote locally and process its vote count and configured rewards without contacting the tracker.
+* `discard` - Close the transaction without awarding it. This does not change the vote status on the tracker.
+
+Only transactions in `ManualReview` with no active request can be resolved. Use `grant` only after verifying the external result: it does not mark the vote as claimed on the tracker, so an unclaimed external vote could be rewarded again later.
+
+`eve.setvote` changes only the stored counter and refuses changes while an unfinished transaction has an assigned target vote count.
 
 ## Configuration
 ```json
@@ -60,10 +72,10 @@ Compatible custom voting sites can also be added through the configuration.
   },
   "Rewards": {
     "@": [
-      "giveto {playerid} supply.signal 1"
+      "inventory.giveto {playerid} supply.signal 1"
     ],
     "first": [
-      "giveto {playerid} stones 10000",
+      "inventory.giveto {playerid} stones 10000",
       "sr add {playerid} 10000"
     ],
     "3": [
@@ -155,6 +167,8 @@ Compatible custom voting sites can also be added through the configuration.
 
 Unconfigured entries such as `ID:KEY`, empty IDs, or empty API keys are ignored and do not generate web requests.
 
+Keep `Enable Verbose Debugging?` disabled on production servers. It overrides voting API response values rather than just enabling extra logging.
+
 ## Rewards
 Reward keys are optional and can be combined in any configuration:
 
@@ -165,13 +179,17 @@ Reward keys are optional and can be combined in any configuration:
 Available command placeholders:
 
 * `{playerid}` - The player's Steam ID.
-* `{playername}` - The player's current display name.
+* `{playername}` - The player's display name when the reward commands are prepared.
 
 When `Vote rewards cumulative` is `false`, only the numeric reward matching the current vote count is executed.
 
 When `Vote rewards cumulative` is `true`, every numeric reward whose number is less than or equal to the player's current vote count is executed. The `@` reward still runs once per vote, and `first` still runs only on the first vote.
 
 The `@`, `first`, and numeric entries may be removed entirely. Empty reward lists and empty commands are ignored safely.
+
+Rewards execute the server commands configured by the administrator. The plugin does not validate whether another plugin or command actually applied the item, currency or permission.
+
+Reward commands are saved as a snapshot when a claim is confirmed. Later configuration changes do not alter those saved commands during recovery. The player must be connected and awake for delivery; their state is checked again before each command.
 
 ## Automatic Vote Claiming
 The plugin automatically checks and claims votes:
@@ -182,9 +200,32 @@ The plugin automatically checks and claims votes:
 * Shortly after the player uses `/vote`.
 * When the player manually uses `/claim`.
 
-Status and claim requests are queued to avoid sending a large number of requests simultaneously. Duplicate checks and claims for the same player, server, and voting site are prevented while a request is pending.
+By default, online players are checked every `300` seconds and `/vote` schedules a check after `60` seconds. The follow-up delay starts when `/vote` is used, not when voting is completed on the website. Set either interval to `0` to disable that check.
 
-If a vote is claimed while the player disconnects, the generated reward commands are stored in `oxide/data/EasyVoteExtended_PendingRewards.json` and delivered when the player reconnects.
+Status and claim requests are queued and spaced apart. Duplicate checks and claims for the same player, server, and voting site are prevented while a request is pending. Vote API requests use a `15`-second timeout; manual checks do not bypass an active request or a scheduled retry delay.
+
+If a vote is claimed while the player disconnects or sleeps, the generated reward commands are stored in `EasyVoteExtended_PendingRewards.json` in the framework's data directory and delivered once the player is connected and awake. Pending local work is checked every `5` seconds independently of periodic website checks, while scheduled retry delays are still respected.
+
+## Claim Recovery and Data Protection
+Uncertain claim results are preserved and checked against the tracker status before another claim is attempted. Transactions that cannot be resolved automatically remain in `ManualReview` for `eve.pending` and `eve.resolve`; further claims for the same player, server and site wait for resolution.
+
+Recovery assumes that only one plugin instance claims a particular external vote. Do not run multiple instances that compete to claim the same vote with the same tracker credentials.
+
+The plugin uses these files in the framework's data directory:
+
+* `EasyVoteExtended.json` - Player vote counts.
+* `EasyVoteExtended_PendingRewards.json` - Saved reward commands waiting for delivery.
+* `EasyVoteExtended_PendingClaims.json` - Claim transactions, retry information and confirmed reward snapshots.
+* `EasyVoteExtended_ResetJournal.json` - Saved player or full-reset operations that need to finish after an interruption.
+
+Configuration and data writes use temporary files and backups when replacing existing files. Unreadable files are preserved instead of being replaced with empty data or defaults. Voting pauses when safe loading is not possible; repair the files and reload the plugin. A saved reset journal allows an interrupted reset to resume after a reload or restart.
+
+Reward commands are removed from the saved queue before execution to avoid replaying uncertain commands. A crash between saving that removal and executing a command can lose that command. Commands that throw during dispatch are logged and are not replayed automatically.
+
+Back up the configuration, language files and all EasyVoteExtended data files together before updating. Do not delete the pending files or reset journal to force recovery.
+
+## Discord Announcements
+Discord announcements use a separate in-memory queue with timeouts, limited retries and rate-limit handling. Automatic mentions are disabled and message length is limited. Discord failures do not rerun reward commands. Queued announcements are not retained after a plugin reload or server restart.
 
 ## Adding a Custom Voting Site
 A custom tracker must be added to both `Voting Sites API Information` and the desired server inside `Server Voting IDs and Keys`.
@@ -230,6 +271,8 @@ The claim endpoint must return `1` when the vote is successfully claimed.
 
 ## Custom Vote Links
 A value inside `Server Vote Custom link` replaces the individual tracker links displayed by `/vote` for that server.
+
+The key must exactly match the server key in `Server Voting IDs and Keys`, including capitalization. For example, use `ServerName1` in both sections. This only changes the displayed link; keep the tracker IDs and API keys configured for checking and claiming votes.
 
 Remove the custom-link entry when you want `/vote` to display each configured tracker separately.
 
