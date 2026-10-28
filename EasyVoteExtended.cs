@@ -16,7 +16,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("Easy Vote Extended", "dFxPhoeniX & TimRS", "3.3.2")]
+    [Info("Easy Vote Extended", "dFxPhoeniX & TimRS", "3.3.6")]
     [Description("The best Rust server voting system")]
     public class EasyVoteExtended : RustPlugin
     {
@@ -58,9 +58,11 @@ namespace Oxide.Plugins
         // Constants
         ////////////////////////////////////////////////////////////
 
-        private const int CurrentConfigurationVersion = 1;
+        private const int CurrentConfigurationVersion = 2;
         private const int DefaultAutomaticVoteCheckInterval = 300;
         private const int DefaultVoteFollowUpCheckDelay = 60;
+        private const int VoteFollowUpCheckDuration = 300;
+        private const int MinimumVoteFollowUpCheckInterval = 30;
         private const float VoteRequestSpacing = 0.2f;
         private const float ManualCommandCooldown = 10f;
         private const float VoteApiRequestTimeout = 15f;
@@ -215,13 +217,13 @@ namespace Oxide.Plugins
             discordQueue.Clear();
             discordRequestToken = null;
 
-            // Preserve a reset intent if storage recovered just before unloading.
+            // Preserve a reset intent if storage recovered just before unloading
             if (dataLoaded && pendingResetJournal != null)
             {
                 TryWriteJson(GetDataPath(ResetJournalDataFileName), pendingResetJournal);
             }
 
-            // Do not overwrite unreadable files or a reset that still needs recovery.
+            // Do not overwrite unreadable files or a reset that still needs recovery
             if (dataLoaded && !resetInProgress && claimsDirty)
             {
                 SavePendingClaimsData();
@@ -339,7 +341,7 @@ namespace Oxide.Plugins
 
             if (response == "2" && transaction.HadAmbiguousFailure)
             {
-                // This recovery assumes only one consumer claims this external vote.
+                // This recovery assumes only one consumer claims this external vote
                 ConfirmClaimTransaction(pendingClaimKey, transaction);
                 return;
             }
@@ -374,9 +376,7 @@ namespace Oxide.Plugins
         {
             transaction = null;
 
-            return CanProcessVotes() && !string.IsNullOrEmpty(transactionId) &&
-                pendingClaimTransactions.TryGetValue(pendingClaimKey, out transaction) && transaction != null &&
-                string.Equals(transaction.TransactionId, transactionId, StringComparison.Ordinal);
+            return CanProcessVotes() && !string.IsNullOrEmpty(transactionId) && pendingClaimTransactions.TryGetValue(pendingClaimKey, out transaction) && transaction != null && string.Equals(transaction.TransactionId, transactionId, StringComparison.Ordinal);
         }
 
         private void ConfirmClaimTransaction(string pendingClaimKey, PendingClaimTransaction transaction)
@@ -445,8 +445,7 @@ namespace Oxide.Plugins
 
             try
             {
-                if (pendingClaimTransactions.Values.Any(other => other != null && !ReferenceEquals(other, transaction) && other.PlayerId == transaction.PlayerId &&
-                    other.State == ClaimStateConfirmed && other.TargetVoteCount > 0 && other.TargetVoteCount < transaction.TargetVoteCount))
+                if (pendingClaimTransactions.Values.Any(other => other != null && !ReferenceEquals(other, transaction) && other.PlayerId == transaction.PlayerId && other.State == ClaimStateConfirmed && other.TargetVoteCount > 0 && other.TargetVoteCount < transaction.TargetVoteCount))
                 {
                     ScheduleClaimRetry(pendingClaimKey);
                     return;
@@ -459,7 +458,7 @@ namespace Oxide.Plugins
                     return;
                 }
 
-                // Persist confirmation before changing the counter or preparing delivery.
+                // Persist confirmation before changing the counter or preparing delivery
                 if (claimsDirty && !SavePendingClaimsData())
                 {
                     ScheduleClaimRetry(pendingClaimKey);
@@ -481,7 +480,7 @@ namespace Oxide.Plugins
                     return;
                 }
 
-                // Delivery remains locked while this confirmed transaction exists.
+                // Delivery remains locked while this confirmed transaction exists
                 if (!RemovePendingClaimTransaction(pendingClaimKey))
                 {
                     ScheduleClaimRetry(pendingClaimKey);
@@ -545,6 +544,11 @@ namespace Oxide.Plugins
             if (code != 200)
             {
                 ConsoleWarn($"Vote status request failed for {playerId} on {site} ({serverName}): HTTP {code}. Check the provider, connectivity and configured credentials.");
+                if (notifyPlayer)
+                {
+                    NotifyVoteCheckFailed(playerId, site);
+                }
+
                 return;
             }
 
@@ -562,7 +566,7 @@ namespace Oxide.Plugins
 
             if (response == "1")
             {
-                // Keep the exact username used by this status request for its claim.
+                // Keep the exact username used by this status request for its claim
                 EnqueueClaimRequest(playerId, playerName, serverName, site, notifyPlayer);
                 return;
             }
@@ -586,6 +590,19 @@ namespace Oxide.Plugins
             }
 
             ConsoleWarn($"Unexpected status response from {site} for {playerId} on {serverName}. Expected plain 0, 1 or 2.");
+            if (notifyPlayer)
+            {
+                NotifyVoteCheckFailed(playerId, site);
+            }
+        }
+
+        private void NotifyVoteCheckFailed(ulong playerId, string site)
+        {
+            BasePlayer player = FindPlayer(playerId);
+            if (player != null && player.IsConnected)
+            {
+                player.ChatMessage(_lang("VoteCheckFailed", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], site));
+            }
         }
 
         private bool IsActiveStatusRequest(string pendingStatusKey, string statusRequestToken)
@@ -922,7 +939,7 @@ namespace Oxide.Plugins
             pendingClaimTransactions.Remove(pendingClaimKey);
             if (!SavePendingClaimsData())
             {
-                // Keep delivery locked until the removal is durable.
+                // Keep delivery locked until the removal is durable
                 pendingClaimTransactions[pendingClaimKey] = transaction;
                 return false;
             }
@@ -973,12 +990,18 @@ namespace Oxide.Plugins
 
         private void MarkClaimForReview(string key, PendingClaimTransaction transaction, string reason)
         {
+            bool notifyPlayer = transaction.State != ClaimStateManualReview;
             transaction.State = ClaimStateManualReview;
             transaction.ReviewReason = reason;
             transaction.NextAttemptUtcTicks = 0;
             scheduledClaimRetries.Remove(key);
             SavePendingClaimsData();
             ConsoleWarn($"Vote transaction {transaction.TransactionId} for {transaction.PlayerId} requires manual review: {reason} Use eve.pending and eve.resolve.");
+            BasePlayer player = FindPlayer(transaction.PlayerId);
+            if (notifyPlayer && player != null && player.IsConnected)
+            {
+                player.ChatMessage(_lang("ClaimNeedsReview", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], transaction.Site));
+            }
         }
 
         private bool CloseClaimTransaction(string key, PendingClaimTransaction transaction)
@@ -1121,8 +1144,8 @@ namespace Oxide.Plugins
             string encodedServerId = Uri.EscapeDataString(serverId);
             string encodedPlayerIdentifier = usernameApiEnabled ? Uri.EscapeDataString(playerName ?? string.Empty) : playerId.ToString();
 
-            // Extra format arguments are ignored when the URL does not use them.
-            // {0} = API key/token, {1} = Steam ID or username, {2} = server ID.
+            // Extra format arguments are ignored when the URL does not use them
+            // {0} = API key/token, {1} = Steam ID or username, {2} = server ID
             return string.Format(apiLink, encodedServerKey, encodedPlayerIdentifier, encodedServerId);
         }
 
@@ -1148,9 +1171,7 @@ namespace Oxide.Plugins
                 break;
             }
 
-            if (apiConfiguration == null || !apiConfiguration.ContainsKey(ConfigDefaultKeys.apiClaim) || !apiConfiguration.ContainsKey(ConfigDefaultKeys.apiStatus) ||
-                !apiConfiguration.ContainsKey(ConfigDefaultKeys.apiLink) || !apiConfiguration.ContainsKey(ConfigDefaultKeys.apiUsername) || string.IsNullOrWhiteSpace(apiConfiguration[ConfigDefaultKeys.apiClaim]) ||
-                string.IsNullOrWhiteSpace(apiConfiguration[ConfigDefaultKeys.apiStatus]) || string.IsNullOrWhiteSpace(apiConfiguration[ConfigDefaultKeys.apiLink]))
+            if (apiConfiguration == null || !apiConfiguration.ContainsKey(ConfigDefaultKeys.apiClaim) || !apiConfiguration.ContainsKey(ConfigDefaultKeys.apiStatus) || !apiConfiguration.ContainsKey(ConfigDefaultKeys.apiLink) || !apiConfiguration.ContainsKey(ConfigDefaultKeys.apiUsername) || string.IsNullOrWhiteSpace(apiConfiguration[ConfigDefaultKeys.apiClaim]) || string.IsNullOrWhiteSpace(apiConfiguration[ConfigDefaultKeys.apiStatus]) || string.IsNullOrWhiteSpace(apiConfiguration[ConfigDefaultKeys.apiLink]))
             {
                 return false;
             }
@@ -1168,10 +1189,7 @@ namespace Oxide.Plugins
                 return false;
             }
 
-            string[] idKey = configuredValue.Split(new[]
-            {
-                ':'
-            }, 2);
+            string[] idKey = configuredValue.Split(new[] { ':' }, 2);
             if (idKey.Length != 2)
             {
                 return false;
@@ -1389,7 +1407,7 @@ namespace Oxide.Plugins
                         pendingRewardCommands.Remove(steamId);
                     }
 
-                    // Save removal before dispatch; never automatically replay uncertain commands.
+                    // Save removal before dispatch; never automatically replay uncertain commands
                     if (!SavePendingRewardsData())
                     {
                         if (removedPlayerEntry)
@@ -1533,6 +1551,11 @@ namespace Oxide.Plugins
                         }
                         else
                         {
+                            if (notifyPlayer)
+                            {
+                                player.ChatMessage(_lang("ClaimInProgress", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], configuredSiteName));
+                            }
+
                             QueuePendingClaimTransaction(pendingStatusKey);
                         }
 
@@ -1558,6 +1581,11 @@ namespace Oxide.Plugins
 
                     if (!pendingStatusChecks.Add(pendingStatusKey))
                     {
+                        if (notifyPlayer)
+                        {
+                            player.ChatMessage(_lang("ClaimInProgress", player.UserIDString, _config.PluginSettings[ConfigDefaultKeys.Prefix], configuredSiteName));
+                        }
+
                         continue;
                     }
 
@@ -1749,7 +1777,7 @@ namespace Oxide.Plugins
                     }
                     catch (Exception)
                     {
-                        // Use bounded exponential backoff if Discord's response is invalid.
+                        // Use bounded exponential backoff if Discord's response is invalid
                     }
                 }
 
@@ -1806,6 +1834,8 @@ namespace Oxide.Plugins
             ulong playerId = player.userID;
             string token = Guid.NewGuid().ToString("N");
             scheduledVoteChecks[playerId] = token;
+            int interval = Math.Max(delay, MinimumVoteFollowUpCheckInterval);
+            int remainingChecks = 1 + Math.Max(0, VoteFollowUpCheckDuration - delay) / interval;
             Action followUp = null;
             followUp = () =>
             {
@@ -1824,13 +1854,24 @@ namespace Oxide.Plugins
 
                 if (!CanProcessVotes())
                 {
-                    // Keep the check scheduled while a storage reset is being retried.
+                    // Keep the check scheduled while a storage reset is being retried
                     timer.Once(LocalProcessingInterval, followUp);
                     return;
                 }
 
-                scheduledVoteChecks.Remove(playerId);
-                CheckVotingStatus(currentPlayer, false);
+                if (voteRequestQueue.Count == 0)
+                {
+                    CheckVotingStatus(currentPlayer, false);
+                }
+
+                remainingChecks--;
+                if (remainingChecks <= 0)
+                {
+                    scheduledVoteChecks.Remove(playerId);
+                    return;
+                }
+
+                timer.Once(interval, followUp);
             };
 
             timer.Once(delay, followUp);
@@ -1916,7 +1957,7 @@ namespace Oxide.Plugins
                 }
                 catch (Exception)
                 {
-                    // A logging failure must not interrupt storage error handling.
+                    // A logging failure must not interrupt storage error handling
                 }
             }
 
@@ -1933,7 +1974,7 @@ namespace Oxide.Plugins
                 }
                 catch (Exception)
                 {
-                    // Keep the console warning available when file logging fails.
+                    // Keep the console warning available when file logging fails
                 }
             }
 
@@ -1955,7 +1996,7 @@ namespace Oxide.Plugins
                 }
                 catch (Exception)
                 {
-                    // Keep vote processing independent of file logging.
+                    // Keep vote processing independent of file logging
                 }
             }
 
@@ -2143,7 +2184,8 @@ namespace Oxide.Plugins
                 return;
             }
 
-            player.ChatMessage(_lang("EarnRewardAutomatic", player.UserIDString));
+            string messageKey = GetAutomaticVoteCheckInterval() > 0 || GetVoteFollowUpCheckDelay() > 0 ? "EarnRewardAutomatic" : "EarnRewardManual";
+            player.ChatMessage(_lang(messageKey, player.UserIDString));
             ScheduleVoteFollowUpCheck(player);
         }
 
@@ -2178,7 +2220,7 @@ namespace Oxide.Plugins
                 _Debug($"Player: {player.displayName}/{player.UserIDString}");
             }
 
-            // Keep /claim available for manual checks alongside automatic claims.
+            // Keep /claim available for manual checks alongside automatic claims
             CheckVotingStatus(player);
         }
 
@@ -2204,7 +2246,10 @@ namespace Oxide.Plugins
                 return;
             }
 
-            List<PendingClaimTransaction> transactions = pendingClaimTransactions.Values.Where(transaction => steamId == null || transaction.PlayerId.ToString() == steamId).OrderBy(transaction => transaction.CreatedUtcTicks).ToList();
+            List<PendingClaimTransaction> transactions = pendingClaimTransactions.Values
+                .Where(transaction => steamId == null || transaction.PlayerId.ToString() == steamId)
+                .OrderBy(transaction => transaction.CreatedUtcTicks)
+                .ToList();
             if (transactions.Count == 0)
             {
                 ReplyConsoleLocalized(arg, "ConsolePendingNone");
@@ -2588,7 +2633,7 @@ namespace Oxide.Plugins
             {
                 string formattedMessage = string.Format(message, args);
 
-                // Trim leading whitespace when the first formatting argument is empty.
+                // Trim leading whitespace when the first formatting argument is empty
                 if (args != null && args.Length > 0 && string.IsNullOrWhiteSpace(args[0]?.ToString()))
                 {
                     return formattedMessage.TrimStart();
@@ -2688,6 +2733,17 @@ namespace Oxide.Plugins
                 [ConfigDefaultKeys.apiClaim] = "https://rustserverlist.com/api/vote?action=claim&key={0}&steamid={1}",
                 [ConfigDefaultKeys.apiStatus] = "https://rustserverlist.com/api/vote?action=status&key={0}&steamid={1}",
                 [ConfigDefaultKeys.apiLink] = "https://rustserverlist.com/server/{0}",
+                [ConfigDefaultKeys.apiUsername] = "false"
+            };
+        }
+
+        private Dictionary<string, string> GetGameSentryApiConfiguration()
+        {
+            return new Dictionary<string, string>
+            {
+                [ConfigDefaultKeys.apiClaim] = "https://api.gamesentry.gg/v1/vote/claim?key={0}&steamid={1}&server={2}",
+                [ConfigDefaultKeys.apiStatus] = "https://api.gamesentry.gg/v1/vote/status?key={0}&steamid={1}&server={2}",
+                [ConfigDefaultKeys.apiLink] = "https://gamesentry.gg/v/{0}",
                 [ConfigDefaultKeys.apiUsername] = "false"
             };
         }
@@ -2816,7 +2872,7 @@ namespace Oxide.Plugins
                 configChanged = true;
             }
 
-            if (_config.ConfigurationVersion < CurrentConfigurationVersion)
+            if (_config.ConfigurationVersion < 1)
             {
                 foreach (KeyValuePair<string, Dictionary<string, string>> server in _config.Servers)
                 {
@@ -2846,7 +2902,42 @@ namespace Oxide.Plugins
 
                     configChanged |= AddMissingSettings(_config.VoteSitesAPI[rustServerListKey], GetRustServerListApiConfiguration());
                 }
+            }
 
+            if (_config.ConfigurationVersion < 2)
+            {
+                foreach (KeyValuePair<string, Dictionary<string, string>> server in _config.Servers)
+                {
+                    Dictionary<string, string> serverVoteSites = server.Value;
+                    bool hasGameSentry = serverVoteSites.Keys.Any(key => key.Equals("GameSentry.gg", StringComparison.OrdinalIgnoreCase));
+
+                    if (!hasGameSentry)
+                    {
+                        serverVoteSites["GameSentry.gg"] = "ID:KEY";
+                        configChanged = true;
+                    }
+                }
+
+                string gameSentryKey = _config.VoteSitesAPI.Keys.FirstOrDefault(key => key.Equals("GameSentry.gg", StringComparison.OrdinalIgnoreCase));
+                if (gameSentryKey == null)
+                {
+                    _config.VoteSitesAPI["GameSentry.gg"] = GetGameSentryApiConfiguration();
+                    configChanged = true;
+                }
+                else
+                {
+                    if (_config.VoteSitesAPI[gameSentryKey] == null)
+                    {
+                        _config.VoteSitesAPI[gameSentryKey] = new Dictionary<string, string>();
+                        configChanged = true;
+                    }
+
+                    configChanged |= AddMissingSettings(_config.VoteSitesAPI[gameSentryKey], GetGameSentryApiConfiguration());
+                }
+            }
+
+            if (_config.ConfigurationVersion < CurrentConfigurationVersion)
+            {
                 _config.ConfigurationVersion = CurrentConfigurationVersion;
                 configChanged = true;
             }
@@ -2858,8 +2949,7 @@ namespace Oxide.Plugins
                 string claimUrl;
                 string statusUrl;
 
-                bool usesUsernameEndpoint = topGamesConfiguration.TryGetValue(ConfigDefaultKeys.apiClaim, out claimUrl) && topGamesConfiguration.TryGetValue(ConfigDefaultKeys.apiStatus, out statusUrl) &&
-                    ((claimUrl != null && claimUrl.IndexOf("playername={1}", StringComparison.OrdinalIgnoreCase) >= 0) || (statusUrl != null && statusUrl.IndexOf("playername={1}", StringComparison.OrdinalIgnoreCase) >= 0));
+                bool usesUsernameEndpoint = topGamesConfiguration.TryGetValue(ConfigDefaultKeys.apiClaim, out claimUrl) && topGamesConfiguration.TryGetValue(ConfigDefaultKeys.apiStatus, out statusUrl) && ((claimUrl != null && claimUrl.IndexOf("playername={1}", StringComparison.OrdinalIgnoreCase) >= 0) || (statusUrl != null && statusUrl.IndexOf("playername={1}", StringComparison.OrdinalIgnoreCase) >= 0));
 
                 string usernameSetting;
                 bool usernameEnabled = topGamesConfiguration.TryGetValue(ConfigDefaultKeys.apiUsername, out usernameSetting) && string.Equals(usernameSetting, "true", StringComparison.OrdinalIgnoreCase);
@@ -2974,7 +3064,8 @@ namespace Oxide.Plugins
                     ["GamesFinder.net"] = "ID:KEY",
                     ["Top-Games.net"] = "ID:KEY",
                     ["TrackyServer.com"] = "ID:KEY",
-                    ["RustServerList.com"] = "ID:KEY"
+                    ["RustServerList.com"] = "ID:KEY",
+                    ["GameSentry.gg"] = "ID:KEY"
                 },
                 ["ServerName2"] = new Dictionary<string, string>()
                 {
@@ -2984,7 +3075,8 @@ namespace Oxide.Plugins
                     ["GamesFinder.net"] = "ID:KEY",
                     ["Top-Games.net"] = "ID:KEY",
                     ["TrackyServer.com"] = "ID:KEY",
-                    ["RustServerList.com"] = "ID:KEY"
+                    ["RustServerList.com"] = "ID:KEY",
+                    ["GameSentry.gg"] = "ID:KEY"
                 }
             };
 
@@ -3037,7 +3129,8 @@ namespace Oxide.Plugins
                     [ConfigDefaultKeys.apiLink] = "https://trackyserver.com/server/{0}",
                     [ConfigDefaultKeys.apiUsername] = "false"
                 },
-                ["RustServerList.com"] = GetRustServerListApiConfiguration()
+                ["RustServerList.com"] = GetRustServerListApiConfiguration(),
+                ["GameSentry.gg"] = GetGameSentryApiConfiguration()
             };
 
             SaveConfig();
@@ -3077,21 +3170,24 @@ namespace Oxide.Plugins
             lang.RegisterMessages(new Dictionary<string, string>
             {
                 ["CommandCooldown"] = "{0} Please wait <color=#e67e22>{1}</color> second(s) before using this command again.",
-                ["PendingRewardsDelivered"] = "{0} Your pending vote reward(s) have been delivered!",
-                ["ThankYouPending"] = "{0} Thank you for voting on <color=#e67e22>{2}</color>! You now have <color=#e67e22>{1}</color> vote(s). Your reward is pending and will be delivered when you are fully connected.",
-                ["DiscordWebhookMessagePending"] = "{0} has voted for {1} on {2}. The reward is pending and will be delivered when the player reconnects or wakes up.",
-                ["GlobalChatAnnouncementsPending"] = "{0} <color=#e67e22>{1}</color> has voted <color=#e67e22>{2}</color> time(s). Their reward is pending and will be delivered when they are fully connected.",
-                ["ClaimStatus"] = "{0} <color=#e67e22>{1}</color> reports you have not voted yet on <color=#e67e22>{2}</color>. Vote now!",
-                ["PleaseWait"] = "{0} Checking all the vote sites API's... Please be patient as this can take some time...",
+                ["PendingRewardsDelivered"] = "{0} Vote rewards have been processed.",
+                ["ThankYouPending"] = "{0} Vote on <color=#e67e22>{2}</color> confirmed! Total votes: <color=#e67e22>{1}</color>. Rewards are pending. Delivery will be retried automatically.",
+                ["DiscordWebhookMessagePending"] = "{0} voted for {1} on {2}. Rewards are pending. Delivery will be retried automatically.",
+                ["GlobalChatAnnouncementsPending"] = "{0} <color=#e67e22>{1}</color> has voted <color=#e67e22>{2}</color> time(s). Rewards are pending. Delivery will be retried automatically.",
+                ["ClaimStatus"] = "{0} No unclaimed vote was found for <color=#e67e22>{2}</color> on <color=#e67e22>{1}</color>. If you just voted, try again shortly.",
+                ["PleaseWait"] = "{0} Checking your votes...",
+                ["ClaimInProgress"] = "{0} A check or claim is already in progress on <color=#e67e22>{1}</color>. Please wait.",
+                ["VoteCheckFailed"] = "{0} Votes on <color=#e67e22>{1}</color> could not be checked right now. Please try again later.",
                 ["VoteList"] = "{0} You can vote for our server at the following links:",
-                ["EarnRewardAutomatic"] = "Your reward will be claimed automatically while you are online or the next time you connect!",
-                ["ThankYou"] = "{0} Thank you for voting on <color=#e67e22>{2}</color>! You now have <color=#e67e22>{1}</color> vote(s). Your reward has been delivered!",
+                ["EarnRewardAutomatic"] = "Vote using the links above. Your vote will be claimed automatically while you are online. Use <color=#e67e22>/claim</color> for a manual check.",
+                ["EarnRewardManual"] = "After voting, use <color=#e67e22>/claim</color> to claim your reward.",
+                ["ThankYou"] = "{0} Vote on <color=#e67e22>{2}</color> confirmed! Total votes: <color=#e67e22>{1}</color>. Vote rewards have been processed.",
                 ["ThankYouNoReward"] = "{0} Thank you for voting! Your vote on <color=#e67e22>{2}</color> was recorded, bringing your total to <color=#e67e22>{1}</color>. No reward is configured for this vote milestone.",
-                ["NoRewards"] = "{0} You haven't voted for <color=#e67e22>{1}</color> on <color=#e67e22>{2}</color> yet! Type <color=#e67e22>/vote</color> to get started!",
-                ["GlobalChatAnnouncements"] = "{0} <color=#e67e22>{1}</color> has voted <color=#e67e22>{2}</color> time(s) and just received their rewards. Find out where you can vote by typing <color=#e67e22>/vote</color>\nTo see a list of available rewards type <color=#e67e22>/rewardlist</color>",
+                ["NoRewards"] = "{0} No unclaimed vote was found for <color=#e67e22>{1}</color> on <color=#e67e22>{2}</color>. If you just voted, try again shortly. Voting links: <color=#e67e22>/vote</color>.",
+                ["GlobalChatAnnouncements"] = "{0} <color=#e67e22>{1}</color> has voted <color=#e67e22>{2}</color> time(s). Vote rewards have been processed. Voting links: <color=#e67e22>/vote</color>.\nAvailable rewards: <color=#e67e22>/rewardlist</color>.",
                 ["GlobalChatAnnouncementsNoReward"] = "{0} <color=#e67e22>{1}</color> has voted <color=#e67e22>{2}</color> time(s). Find out where you can vote by typing <color=#e67e22>/vote</color>.",
-                ["AlreadyVoted"] = "{0} <color=#e67e22>{1}</color> reports you have already voted! Vote again later.",
-                ["DiscordWebhookMessage"] = "{0} has voted for {1} on {2} and got some rewards! Type /rewardlist in game to find out what you can get when you vote for us!",
+                ["AlreadyVoted"] = "{0} Your vote on <color=#e67e22>{1}</color> has already been claimed.",
+                ["DiscordWebhookMessage"] = "{0} voted for {1} on {2}. Vote rewards have been processed. Available rewards: /rewardlist.",
                 ["DiscordWebhookMessageNoReward"] = "{0} has voted for {1} on {2}. The vote was recorded successfully.",
                 ["RewardsListHeader"] = "{0} The following rewards are given for voting!",
                 ["NoConfiguredRewards"] = "No vote rewards are currently configured.",
@@ -3099,9 +3195,9 @@ namespace Oxide.Plugins
                 ["RewardDescriptionMissing"] = "Description not configured",
                 ["EveryVote"] = "Every Vote: <color=#e67e22>{0}</color>",
                 ["FirstVote"] = "First Vote: <color=#e67e22>{0}</color>",
-                ["NumberVote"] = "Vote no. {0}: <color=#e67e22>{1}</color>",
-                ["VoteLink"] = "{0} ({1}): <color=#e67e22>{2}</color>",
-                ["VoteLinkCustom"] = "{0}: <color=#e67e22>{1}</color>",
+                ["NumberVote"] = "Vote no. <color=#e67e22>{0}</color>: <color=#e67e22>{1}</color>",
+                ["VoteLink"] = "<color=#e67e22>{0}</color> (<color=#e67e22>{1}</color>): <color=#e67e22>{2}</color>",
+                ["VoteLinkCustom"] = "<color=#e67e22>{0}</color>: <color=#e67e22>{1}</color>",
                 ["ConsoleServerOnly"] = "The command '{0}' can only be executed from the server console or RCON.",
                 ["ConsolePlayerNotFound"] = "No player was found matching '{0}'.",
                 ["ConsoleClearVoteUsage"] = "Usage: {0} <steamid|username>",
@@ -3114,7 +3210,7 @@ namespace Oxide.Plugins
                 ["ConsoleResetVoteDataUsage"] = "Usage: {0}",
                 ["ConsoleResetVoteDataSuccess"] = "Vote data has been reset for {0} player(s).",
                 ["StorageUnavailable"] = "{0} Voting is temporarily unavailable because its data could not be loaded safely. Please contact an administrator.",
-                ["ClaimNeedsReview"] = "{0} Your pending vote on {1} needs administrator review before another claim can be processed.",
+                ["ClaimNeedsReview"] = "{0} Your pending vote on <color=#e67e22>{1}</color> needs administrator review before another claim can be processed.",
                 ["ConsoleOperationFailed"] = "The operation could not be completed safely. Check the server log before retrying.",
                 ["ConsolePendingCountChange"] = "Cannot change the counter for {0} while a confirmed transaction is unfinished. Resolve it first, or use eve.clearvote to explicitly clear pending data.",
                 ["ConsolePendingUsage"] = "Usage: eve.pending [steamid|username]",
@@ -3126,29 +3222,32 @@ namespace Oxide.Plugins
                 ["ConsoleTransactionNotFound"] = "No pending vote transaction matches '{0}'.",
                 ["ConsoleResolveNotReview"] = "Transaction {0} is not awaiting manual review or still has a request in progress.",
                 ["ConsoleResolutionRequested"] = "Resolution '{1}' requested for transaction {0}. Use eve.pending to check any remaining work.",
-                ["ThankYouDispatchFailed"] = "{0} Your vote on {2} was recorded. A reward command failed during dispatch; please contact an administrator.",
+                ["ThankYouDispatchFailed"] = "{0} Your vote on <color=#e67e22>{2}</color> was recorded. A reward command failed during dispatch; please contact an administrator.",
                 ["DiscordWebhookMessageFailed"] = "{0} voted for {1} on {2}, but a reward command failed during dispatch. Administrator review is required.",
-                ["GlobalChatAnnouncementsFailed"] = "{0} {1} has voted {2} time(s). Their reward needs administrator review."
+                ["GlobalChatAnnouncementsFailed"] = "{0} <color=#e67e22>{1}</color> has voted <color=#e67e22>{2}</color> time(s). Their reward needs administrator review."
             }, this);
 
             lang.RegisterMessages(new Dictionary<string, string>
             {
                 ["CommandCooldown"] = "{0} Te rugăm să aștepți <color=#e67e22>{1}</color> secunde înainte de a folosi din nou această comandă.",
-                ["PendingRewardsDelivered"] = "{0} Recompensele de vot aflate în așteptare au fost acordate!",
-                ["ThankYouPending"] = "{0} Mulțumim pentru votul pe <color=#e67e22>{2}</color>! Ai acum <color=#e67e22>{1}</color> voturi. Recompensa este în așteptare și va fi acordată după ce ești conectat complet.",
-                ["DiscordWebhookMessagePending"] = "{0} a votat pentru {1} pe {2}. Recompensa este în așteptare și va fi acordată atunci când jucătorul se reconectează sau se trezește.",
-                ["GlobalChatAnnouncementsPending"] = "{0} <color=#e67e22>{1}</color> a votat de <color=#e67e22>{2}</color> ori. Recompensa este în așteptare și va fi acordată când jucătorul este conectat complet.",
-                ["ClaimStatus"] = "{0} <color=#e67e22>{1}</color> raportează că nu ai votat încă pe <color=#e67e22>{2}</color>. Votează acum!",
-                ["PleaseWait"] = "{0} Se verifică toate API-urile site-urilor de vot... Te rugăm să ai răbdare, acest proces poate dura ceva timp...",
+                ["PendingRewardsDelivered"] = "{0} Recompensele de vot au fost procesate.",
+                ["ThankYouPending"] = "{0} Votul de pe <color=#e67e22>{2}</color> a fost confirmat! Total voturi: <color=#e67e22>{1}</color>. Recompensele sunt în așteptare. Acordarea lor va fi reîncercată automat.",
+                ["DiscordWebhookMessagePending"] = "{0} a votat pentru {1} pe {2}. Recompensele sunt în așteptare. Acordarea lor va fi reîncercată automat.",
+                ["GlobalChatAnnouncementsPending"] = "{0} <color=#e67e22>{1}</color> a votat de <color=#e67e22>{2}</color> ori. Recompensele sunt în așteptare. Acordarea lor va fi reîncercată automat.",
+                ["ClaimStatus"] = "{0} Nu am găsit un vot nerevendicat pentru <color=#e67e22>{2}</color> pe <color=#e67e22>{1}</color>. Dacă tocmai ai votat, încearcă din nou peste puțin timp.",
+                ["PleaseWait"] = "{0} Verificăm voturile tale...",
+                ["ClaimInProgress"] = "{0} O verificare sau revendicare este deja în curs pe <color=#e67e22>{1}</color>. Te rugăm să aștepți.",
+                ["VoteCheckFailed"] = "{0} Voturile de pe <color=#e67e22>{1}</color> nu au putut fi verificate acum. Încearcă din nou mai târziu.",
                 ["VoteList"] = "{0} Poți vota pentru server-ul nostru accesând următoarele link-uri:",
-                ["EarnRewardAutomatic"] = "Recompensa va fi revendicată automat cât timp ești online sau data viitoare când intri pe server!",
-                ["ThankYou"] = "{0} Mulțumim pentru votul pe <color=#e67e22>{2}</color>! Ai acum <color=#e67e22>{1}</color> voturi. Recompensa a fost acordată!",
+                ["EarnRewardAutomatic"] = "Votează folosind linkurile de mai sus. Votul va fi revendicat automat cât timp ești online. Pentru o verificare manuală, folosește <color=#e67e22>/claim</color>.",
+                ["EarnRewardManual"] = "După ce votezi, folosește <color=#e67e22>/claim</color> pentru a revendica recompensa.",
+                ["ThankYou"] = "{0} Votul de pe <color=#e67e22>{2}</color> a fost confirmat! Total voturi: <color=#e67e22>{1}</color>. Recompensele de vot au fost procesate.",
                 ["ThankYouNoReward"] = "{0} Mulțumim pentru vot! Votul tău pe <color=#e67e22>{2}</color> a fost înregistrat, iar acum ai <color=#e67e22>{1}</color> voturi. Nu este configurată nicio recompensă pentru acest prag.",
-                ["NoRewards"] = "{0} Nu ai votat pentru <color=#e67e22>{1}</color> pe <color=#e67e22>{2}</color> încă! Scrie <color=#e67e22>/vote</color> pentru a începe!",
-                ["GlobalChatAnnouncements"] = "{0} <color=#e67e22>{1}</color> a votat de <color=#e67e22>{2}</color> ori și tocmai a primit recompensele. Află unde poți vota scriind <color=#e67e22>/vote</color>\nPentru a vedea lista de recompense disponibile, scrie <color=#e67e22>/rewardlist</color>",
+                ["NoRewards"] = "{0} Nu am găsit un vot nerevendicat pentru <color=#e67e22>{1}</color> pe <color=#e67e22>{2}</color>. Dacă tocmai ai votat, încearcă din nou peste puțin timp. Linkuri pentru vot: <color=#e67e22>/vote</color>.",
+                ["GlobalChatAnnouncements"] = "{0} <color=#e67e22>{1}</color> a votat de <color=#e67e22>{2}</color> ori. Recompensele de vot au fost procesate. Linkuri pentru vot: <color=#e67e22>/vote</color>.\nRecompense disponibile: <color=#e67e22>/rewardlist</color>.",
                 ["GlobalChatAnnouncementsNoReward"] = "{0} <color=#e67e22>{1}</color> a votat de <color=#e67e22>{2}</color> ori. Află unde poți vota scriind <color=#e67e22>/vote</color>.",
-                ["AlreadyVoted"] = "{0} <color=#e67e22>{1}</color> raportează că ai votat deja! Poți vota din nou mai târziu.",
-                ["DiscordWebhookMessage"] = "{0} a votat pentru {1} pe {2} și a primit recompense! Scrie /rewardlist în joc pentru a vedea ce poți obține când votezi pentru noi!",
+                ["AlreadyVoted"] = "{0} Votul tău de pe <color=#e67e22>{1}</color> a fost deja revendicat.",
+                ["DiscordWebhookMessage"] = "{0} a votat pentru {1} pe {2}. Recompensele de vot au fost procesate. Recompense disponibile: /rewardlist.",
                 ["DiscordWebhookMessageNoReward"] = "{0} a votat pentru {1} pe {2}. Votul a fost înregistrat cu succes.",
                 ["RewardsListHeader"] = "{0} Următoarele recompense sunt acordate pentru vot!",
                 ["NoConfiguredRewards"] = "Momentan nu este configurată nicio recompensă pentru vot.",
@@ -3156,9 +3255,9 @@ namespace Oxide.Plugins
                 ["RewardDescriptionMissing"] = "Descriere neconfigurată",
                 ["EveryVote"] = "Fiecare Vot: <color=#e67e22>{0}</color>",
                 ["FirstVote"] = "Primul Vot: <color=#e67e22>{0}</color>",
-                ["NumberVote"] = "Votul nr. {0}: <color=#e67e22>{1}</color>",
-                ["VoteLink"] = "{0} ({1}): <color=#e67e22>{2}</color>",
-                ["VoteLinkCustom"] = "{0}: <color=#e67e22>{1}</color>",
+                ["NumberVote"] = "Votul nr. <color=#e67e22>{0}</color>: <color=#e67e22>{1}</color>",
+                ["VoteLink"] = "<color=#e67e22>{0}</color> (<color=#e67e22>{1}</color>): <color=#e67e22>{2}</color>",
+                ["VoteLinkCustom"] = "<color=#e67e22>{0}</color>: <color=#e67e22>{1}</color>",
                 ["ConsoleServerOnly"] = "Comanda '{0}' poate fi executată doar din consola serverului sau prin RCON.",
                 ["ConsolePlayerNotFound"] = "Nu a fost găsit niciun jucător care să corespundă cu '{0}'.",
                 ["ConsoleClearVoteUsage"] = "Utilizare: {0} <steamid|nume>",
@@ -3171,7 +3270,7 @@ namespace Oxide.Plugins
                 ["ConsoleResetVoteDataUsage"] = "Utilizare: {0}",
                 ["ConsoleResetVoteDataSuccess"] = "Datele de vot au fost resetate pentru {0} jucător(i).",
                 ["StorageUnavailable"] = "{0} Sistemul de vot este temporar indisponibil deoarece datele nu au putut fi încărcate în siguranță. Contactează un administrator.",
-                ["ClaimNeedsReview"] = "{0} Votul tău în așteptare pe {1} necesită verificarea unui administrator înaintea unei noi revendicări.",
+                ["ClaimNeedsReview"] = "{0} Votul tău în așteptare pe <color=#e67e22>{1}</color> necesită verificarea unui administrator înaintea unei noi revendicări.",
                 ["ConsoleOperationFailed"] = "Operația nu a putut fi finalizată în siguranță. Verifică jurnalul serverului înainte de a reîncerca.",
                 ["ConsolePendingCountChange"] = "Contorul pentru {0} nu poate fi modificat cât timp există o tranzacție confirmată nefinalizată. Rezolv-o mai întâi sau folosește eve.clearvote pentru a șterge explicit datele în așteptare.",
                 ["ConsolePendingUsage"] = "Utilizare: eve.pending [steamid|nume]",
@@ -3183,9 +3282,9 @@ namespace Oxide.Plugins
                 ["ConsoleTransactionNotFound"] = "Nu există o tranzacție de vot în așteptare pentru '{0}'.",
                 ["ConsoleResolveNotReview"] = "Tranzacția {0} nu așteaptă verificare manuală sau are încă o cerere în desfășurare.",
                 ["ConsoleResolutionRequested"] = "Rezolvarea '{1}' a fost solicitată pentru tranzacția {0}. Verifică operațiile rămase cu eve.pending.",
-                ["ThankYouDispatchFailed"] = "{0} Votul tău pe {2} a fost înregistrat. O comandă de recompensă a eșuat la executare; contactează un administrator.",
+                ["ThankYouDispatchFailed"] = "{0} Votul tău pe <color=#e67e22>{2}</color> a fost înregistrat. O comandă de recompensă a eșuat la executare; contactează un administrator.",
                 ["DiscordWebhookMessageFailed"] = "{0} a votat pentru {1} pe {2}, dar o comandă de recompensă a eșuat la executare. Este necesară verificarea unui administrator.",
-                ["GlobalChatAnnouncementsFailed"] = "{0} {1} a votat de {2} ori. Recompensa necesită verificarea unui administrator."
+                ["GlobalChatAnnouncementsFailed"] = "{0} <color=#e67e22>{1}</color> a votat de <color=#e67e22>{2}</color> ori. Recompensa necesită verificarea unui administrator."
             }, this, "ro");
         }
 
@@ -3309,7 +3408,7 @@ namespace Oxide.Plugins
 
                 if (File.Exists(path))
                 {
-                    // Never fall back to deleting the original file before replacement.
+                    // Never fall back to deleting the original file before replacement
                     File.Replace(temporaryPath, path, path + ".bak");
                 }
                 else
@@ -3343,7 +3442,7 @@ namespace Oxide.Plugins
                 }
                 catch (Exception)
                 {
-                    // A stale temporary file is never used as authoritative data.
+                    // A stale temporary file is never used as authoritative data
                 }
             }
         }
@@ -3366,7 +3465,7 @@ namespace Oxide.Plugins
             }
             catch (Exception)
             {
-                // Leave the original untouched even if a diagnostic copy cannot be made.
+                // Leave the original untouched even if a diagnostic copy cannot be made
             }
         }
 
@@ -3428,7 +3527,7 @@ namespace Oxide.Plugins
             pendingResetJournal = journal;
             runtimeGeneration++;
 
-            // Invalidate all callbacks; unrelated in-flight claims will be reconciled.
+            // Invalidate all callbacks; unrelated in-flight claims will be reconciled
             activeClaimRequests.Clear();
             pendingStatusChecks.Clear();
             statusRequestTokens.Clear();
@@ -3534,8 +3633,7 @@ namespace Oxide.Plugins
             foreach (KeyValuePair<string, PendingClaimTransaction> entry in loaded)
             {
                 PendingClaimTransaction transaction = entry.Value;
-                if (transaction == null || !IsValidSteamId(transaction.PlayerId) || string.IsNullOrWhiteSpace(transaction.ServerName) || string.IsNullOrWhiteSpace(transaction.Site) ||
-                    entry.Key != GetPendingClaimKey(transaction.PlayerId, transaction.ServerName, transaction.Site))
+                if (transaction == null || !IsValidSteamId(transaction.PlayerId) || string.IsNullOrWhiteSpace(transaction.ServerName) || string.IsNullOrWhiteSpace(transaction.Site) || entry.Key != GetPendingClaimKey(transaction.PlayerId, transaction.ServerName, transaction.Site))
                 {
                     ReportInvalidData(GetDataPath(PendingClaimsDataFileName), "Invalid claim transaction identity.");
                     return false;
@@ -3548,10 +3646,8 @@ namespace Oxide.Plugins
                     return false;
                 }
 
-                bool validState = string.IsNullOrEmpty(transaction.State) || transaction.State == ClaimStateCreated || transaction.State == ClaimStateSent ||
-                    transaction.State == ClaimStateUncertain || transaction.State == ClaimStateConfirmed || transaction.State == ClaimStateManualReview || transaction.State == ClaimStateClosed;
-                if (!validState || transaction.Attempts < 0 || transaction.RecoveryAttempts < 0 || transaction.CreatedUtcTicks < 0 || transaction.CreatedUtcTicks > DateTime.MaxValue.Ticks ||
-                    transaction.TargetVoteCount < 0 || transaction.NextAttemptUtcTicks < 0 || transaction.NextAttemptUtcTicks > DateTime.MaxValue.Ticks)
+                bool validState = string.IsNullOrEmpty(transaction.State) || transaction.State == ClaimStateCreated || transaction.State == ClaimStateSent || transaction.State == ClaimStateUncertain || transaction.State == ClaimStateConfirmed || transaction.State == ClaimStateManualReview || transaction.State == ClaimStateClosed;
+                if (!validState || transaction.Attempts < 0 || transaction.RecoveryAttempts < 0 || transaction.CreatedUtcTicks < 0 || transaction.CreatedUtcTicks > DateTime.MaxValue.Ticks || transaction.TargetVoteCount < 0 || transaction.NextAttemptUtcTicks < 0 || transaction.NextAttemptUtcTicks > DateTime.MaxValue.Ticks)
                 {
                     ReportInvalidData(GetDataPath(PendingClaimsDataFileName), "Invalid claim transaction state. Do not downgrade while transactions are pending.");
                     return false;

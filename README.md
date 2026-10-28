@@ -1,7 +1,7 @@
 ## Overview
 **Easy Vote Extended** is an upgraded version of Easy Vote, the most advanced and versatile voting plugin available, designed to enhance player engagement and community interaction effortlessly.
 
-The plugin includes automatic vote claiming, configurable rewards, per-player language support, Discord announcements, multiple-server support, persistent pending rewards, claim recovery with administrator review, protected data writes, seven built-in voting sites, and support for compatible custom vote trackers.
+The plugin includes automatic vote claiming, configurable rewards, per-player language support, Discord announcements, multiple-server support, persistent pending rewards, claim recovery with administrator review, protected data writes, eight built-in voting sites, and support for compatible custom vote trackers.
 
 A player does not need to run `/claim` after voting. Votes are checked and claimed automatically when the player connects, when the configured sleep-ended check runs, during periodic checks for online players, or shortly after `/vote` is used. The `/claim` command remains available as an optional manual check.
 
@@ -15,11 +15,12 @@ The default configuration includes:
 * `Top-Games.net`
 * `TrackyServer.com`
 * `RustServerList.com`
+* `GameSentry.gg`
 
 Compatible custom voting sites can also be added through the configuration.
 
 ## Chat Commands
-* `/vote` - Display the configured vote link or links and schedule an automatic vote check.
+* `/vote` - Display the configured vote link or links and schedule automatic follow-up checks when enabled.
 * `/claim` - Manually check all configured voting sites. Claiming is otherwise automatic.
 * `/rewardlist` - Display the currently configured vote rewards.
 
@@ -44,7 +45,7 @@ Only transactions in `ManualReview` with no active request can be resolved. Use 
 ## Configuration
 ```json
 {
-  "Configuration Version": 1,
+  "Configuration Version": 2,
   "Debug Settings": {
     "Debug Enabled?": "false",
     "Enable Verbose Debugging?": "false",
@@ -103,7 +104,8 @@ Only transactions in `ManualReview` with no active request can be resolved. Use 
       "GamesFinder.net": "ID:KEY",
       "Top-Games.net": "ID:KEY",
       "TrackyServer.com": "ID:KEY",
-      "RustServerList.com": "ID:KEY"
+      "RustServerList.com": "ID:KEY",
+      "GameSentry.gg": "ID:KEY"
     },
     "ServerName2": {
       "Rust-Servers.net": "ID:KEY",
@@ -112,7 +114,8 @@ Only transactions in `ManualReview` with no active request can be resolved. Use 
       "GamesFinder.net": "ID:KEY",
       "Top-Games.net": "ID:KEY",
       "TrackyServer.com": "ID:KEY",
-      "RustServerList.com": "ID:KEY"
+      "RustServerList.com": "ID:KEY",
+      "GameSentry.gg": "ID:KEY"
     }
   },
   "Server Vote Custom link": {
@@ -160,6 +163,12 @@ Only transactions in `ManualReview` with no active request can be resolved. Use 
       "API Vote status (GET URL)": "https://rustserverlist.com/api/vote?action=status&key={0}&steamid={1}",
       "Vote link (URL)": "https://rustserverlist.com/server/{0}",
       "Site Uses Username Instead of Player Steam ID?": "false"
+    },
+    "GameSentry.gg": {
+      "API Claim Reward (GET URL)": "https://api.gamesentry.gg/v1/vote/claim?key={0}&steamid={1}&server={2}",
+      "API Vote status (GET URL)": "https://api.gamesentry.gg/v1/vote/status?key={0}&steamid={1}&server={2}",
+      "Vote link (URL)": "https://gamesentry.gg/v/{0}",
+      "Site Uses Username Instead of Player Steam ID?": "false"
     }
   }
 }
@@ -187,7 +196,7 @@ When `Vote rewards cumulative` is `true`, every numeric reward whose number is l
 
 The `@`, `first`, and numeric entries may be removed entirely. Empty reward lists and empty commands are ignored safely.
 
-Rewards execute the server commands configured by the administrator. The plugin does not validate whether another plugin or command actually applied the item, currency or permission.
+Rewards execute the server commands configured by the administrator. Any valid reward command can be used. Messages report reward processing; the plugin does not validate whether another plugin or command actually applied the item, currency or permission.
 
 Reward commands are saved as a snapshot when a claim is confirmed. Later configuration changes do not alter those saved commands during recovery. The player must be connected and awake for delivery; their state is checked again before each command.
 
@@ -200,7 +209,11 @@ The plugin automatically checks and claims votes:
 * Shortly after the player uses `/vote`.
 * When the player manually uses `/claim`.
 
-By default, online players are checked every `300` seconds and `/vote` schedules a check after `60` seconds. The follow-up delay starts when `/vote` is used, not when voting is completed on the website. Set either interval to `0` to disable that check.
+By default, online players are checked every `300` seconds. After `/vote`, checks repeat every `60` seconds for five minutes. These timings use the existing settings; repeating `/vote` does not create overlapping checks.
+
+Set either interval to `0` to disable that check. When both are disabled, `/vote` instructs the player to use `/claim`. Otherwise, claiming is automatic and `/claim` remains available for a manual check. Reconnecting is not required.
+
+Automatic checks are silent when no new vote is found. Chat messages distinguish between confirmed votes, pending rewards, already claimed votes, and problems requiring attention.
 
 Status and claim requests are queued and spaced apart. Duplicate checks and claims for the same player, server, and voting site are prevented while a request is pending. Vote API requests use a `15`-second timeout; manual checks do not bypass an active request or a scheduled retry delay.
 
